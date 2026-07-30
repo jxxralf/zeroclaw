@@ -94,6 +94,8 @@ pub mod wati;
 pub mod webhook;
 #[cfg(feature = "channel-wechat")]
 pub mod wechat;
+pub mod wechat_binding;
+pub mod wechat_binding_handler;
 #[cfg(feature = "channel-wecom")]
 pub mod wecom;
 #[cfg(feature = "channel-wecom-ws")]
