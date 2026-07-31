@@ -500,23 +500,55 @@ async fn skip_missed_jobs_on_startup(config: &Config) {
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
     use zeroclaw_log::Instrument;
     let Some(agent_alias) = resolve_owning_agent(config, job) else {
-        return (
-            false,
-            format!(
-                "cron job {id:?} has no owning agent; add the alias to an [agents.<x>].cron_jobs list",
-                id = job.id
-            ),
+        let output = format!(
+            "cron job {id:?} has no owning agent; add the alias to an [agents.<x>].cron_jobs list",
+            id = job.id
         );
+        return (false, render_job_output(job, false, output));
     };
     let agent_alias = agent_alias.to_string();
     let security = match SecurityPolicy::for_agent(config, &agent_alias) {
         Ok(s) => s,
-        Err(e) => return (false, format!("agent {agent_alias} risk profile: {e}")),
+        Err(e) => {
+            let output = format!("agent {agent_alias} risk profile: {e}");
+            return (false, render_job_output(job, false, output));
+        }
     };
     let span = zeroclaw_log::attribution_span!(job);
-    Box::pin(execute_job_with_retry(config, &security, &agent_alias, job))
+    let (success, output) = Box::pin(execute_job_with_retry(config, &security, &agent_alias, job))
         .instrument(span)
-        .await
+        .await;
+    (success, render_job_output(job, success, output))
+}
+
+fn render_job_output(job: &CronJob, success: bool, output: String) -> String {
+    if !matches!(job.job_type, JobType::Shell) {
+        return output;
+    }
+
+    if success {
+        let output = output.trim();
+        return if output.is_empty() {
+            crate::i18n::get_required_cli_string("cron-shell-command-succeeded-no-output")
+        } else {
+            output.to_string()
+        };
+    }
+
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "job_id": job.id,
+                "agent_alias": job.agent_alias,
+                "error_key": "cron.shell.command_failed",
+                "diagnostic": zeroclaw_providers::sanitize_api_error(&output),
+            })),
+        "Cron shell command failed"
+    );
+
+    crate::i18n::get_required_cli_string("cron-shell-command-failed")
 }
 
 fn cron_agent_run_security_policy(base: &SecurityPolicy, job: &CronJob) -> SecurityPolicy {

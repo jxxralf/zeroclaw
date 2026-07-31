@@ -1,3 +1,6 @@
+cron-shell-command-succeeded-no-output = 定时命令执行成功。
+cron-shell-command-failed = 定时命令执行失败，请查看服务端日志了解详情。
+cron-shell-command-blocked = 定时命令被安全策略阻止，请查看服务端日志了解详情。
 cli-about = 最快、最小的 AI 助手。
 cli-no-command-provided = 未提供命令。
 cli-try-quickstart = 尝试运行 `zeroclaw quickstart` 来创建你的第一个智能体。

@@ -1,3 +1,6 @@
+cron-shell-command-succeeded-no-output = The scheduled command completed successfully.
+cron-shell-command-failed = The scheduled command failed. Check the server logs for details.
+cron-shell-command-blocked = The scheduled command was blocked by security policy. Check the server logs for details.
 cli-about = The fastest, smallest AI assistant.
 cli-no-command-provided = No command provided.
 cli-try-quickstart = Try `zeroclaw quickstart` to create your first agent.
