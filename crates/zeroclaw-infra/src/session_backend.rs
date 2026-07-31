@@ -245,6 +245,12 @@ pub trait SessionBackend: Send + Sync {
     fn list_stuck_sessions(&self, _threshold_secs: u64) -> Vec<SessionMetadata> {
         Vec::new()
     }
+
+    /// Get the last activity timestamp for a session.
+    fn last_message_at(&self, session_key: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.get_session_metadata(session_key)
+            .map(|meta| meta.last_activity)
+    }
 }
 
 /// Session state information.

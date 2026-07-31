@@ -199,6 +199,10 @@ impl SessionBackend for SessionStore {
     fn session_exists(&self, session_key: &str) -> bool {
         self.session_path(session_key).exists()
     }
+    fn last_message_at(&self, session_key: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.session_mtime(session_key)
+            .map(chrono::DateTime::<chrono::Utc>::from)
+    }
 }
 
 #[cfg(test)]
