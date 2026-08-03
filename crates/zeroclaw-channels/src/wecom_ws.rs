@@ -32,6 +32,7 @@ const WECOM_WS_READY_WAIT_SECS: u64 = 10;
 const WECOM_WS_READY_POLL_MILLIS: u64 = 100;
 const WECOM_STREAM_CONFLICT_MAX_RETRIES: usize = 3;
 const WECOM_STREAM_CONFLICT_RETRY_BASE_MILLIS: u64 = 150;
+const WECOM_DRAFT_UPDATE_INTERVAL_SECS: u64 = 1;
 const WECOM_IDEMPOTENCY_MAX_KEYS: usize = 4096;
 const WECOM_PROVIDER_TRAILING_SENTINELS: &[&str] = &["<|eom|>"];
 
@@ -297,6 +298,8 @@ pub struct WeComWsChannel {
     last_cleanup: Arc<Mutex<Instant>>,
     idempotency: Arc<SimpleIdempotencyStore>,
     req_id_map: Arc<Mutex<HashMap<String, String>>>, // stream_id → req_id
+    /// Tracks the last successful partial update per active stream.
+    draft_last_update: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 // ── Construction + WS helpers ────────────────────────────────────────
@@ -349,6 +352,7 @@ impl WeComWsChannel {
             last_cleanup: Arc::new(Mutex::new(Instant::now())),
             idempotency: Arc::new(SimpleIdempotencyStore::new()),
             req_id_map: Arc::new(Mutex::new(HashMap::new())),
+            draft_last_update: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1792,8 +1796,21 @@ impl Channel for WeComWsChannel {
         if req_id.is_empty() {
             return Ok(());
         }
+
+        {
+            let last_updates = self.draft_last_update.lock();
+            if last_updates.get(message_id).is_some_and(|last| {
+                last.elapsed() < Duration::from_secs(WECOM_DRAFT_UPDATE_INTERVAL_SECS)
+            }) {
+                return Ok(());
+            }
+        }
+
         self.ws_send_respond_msg(&req_id, message_id, content, false)
             .await?;
+        self.draft_last_update
+            .lock()
+            .insert(message_id.to_string(), Instant::now());
         Ok(())
     }
 
@@ -1809,6 +1826,7 @@ impl Channel for WeComWsChannel {
             .lock()
             .remove(message_id)
             .unwrap_or_default();
+        self.draft_last_update.lock().remove(message_id);
 
         let (stream_content, overflow) = split_stream_content_and_overflow(content);
 
@@ -1846,6 +1864,7 @@ impl Channel for WeComWsChannel {
             .lock()
             .remove(message_id)
             .unwrap_or_default();
+        self.draft_last_update.lock().remove(message_id);
         if !req_id.is_empty() {
             self.ws_send_respond_msg(&req_id, message_id, "", true)
                 .await?;
