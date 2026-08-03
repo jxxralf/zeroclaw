@@ -78,8 +78,9 @@ fn ensure_embedded_web_dist_when_enabled() {
 
     println!("cargo:rerun-if-changed={}", web_dist.display());
 
-    assert!(
-        web_dist.join("index.html").exists(),
-        "feature `embedded-web` requires `web/dist/index.html`; run: cargo web build"
-    );
+    if !web_dist.join("index.html").exists() {
+        panic!(
+            "feature `embedded-web` requires `web/dist/index.html`. Build the frontend first with: cd web && npm ci && npm run build"
+        );
+    }
 }
