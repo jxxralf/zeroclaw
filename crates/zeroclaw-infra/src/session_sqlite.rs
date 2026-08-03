@@ -901,6 +901,21 @@ impl SessionBackend for SqliteSessionBackend {
         .map_err(std::io::Error::other)?;
         Ok(())
     }
+    fn last_message_at(&self, session_key: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT last_activity FROM session_metadata WHERE session_key = ?1",
+            rusqlite::params![session_key],
+            |row| {
+                let activity_str: String = row.get(0)?;
+                Ok(chrono::DateTime::parse_from_rfc3339(&activity_str)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .ok())
+            },
+        )
+        .ok()
+        .flatten()
+    }
 }
 
 #[cfg(test)]
