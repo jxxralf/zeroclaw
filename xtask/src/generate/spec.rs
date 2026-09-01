@@ -805,6 +805,21 @@ pub fn resolve_feature_list(
     resolve_feature_list_from_package(&meta, root, selection)
 }
 
+/// Concrete feature leaves the canonical registry keeps out of
+/// `Selection::Dist`.
+///
+/// Leanness tests assert against this derived set instead of naming a sentinel
+/// feature, so promoting a channel into `dist_extra_features` stays a
+/// one-line registry edit and never requires touching a test.
+#[cfg(test)]
+pub(crate) fn features_outside_dist(manifest_dir: &Path) -> anyhow::Result<Vec<String>> {
+    let dist = resolve_feature_list(manifest_dir, &Selection::Dist)?;
+    Ok(resolve_feature_list(manifest_dir, &Selection::All)?
+        .into_iter()
+        .filter(|feature| !dist.contains(feature))
+        .collect())
+}
+
 fn workspace_root_package(
     meta: &cargo_metadata::Metadata,
 ) -> anyhow::Result<&cargo_metadata::Package> {
@@ -1382,6 +1397,7 @@ mod tests {
             "aggregates must expand, not appear as leaves"
         );
         assert!(r.default_features.contains(&"gateway".to_string()));
+        assert!(!r.default_features.contains(&"channel-git".to_string()));
     }
 
     #[test]
@@ -1406,11 +1422,24 @@ mod tests {
         );
     }
 
+    /// Pins the lean contract by name on purpose: widening `dist` must be a
+    /// deliberate, reviewed edit here, not a silent consequence of a registry
+    /// change. The generator suites derive their expectations from the
+    /// registry; this one stays the policy tripwire.
     #[test]
     fn dist_matches_lean_release_contract() {
         let features = resolve_feature_list(&root(), &Selection::Dist).unwrap();
+        assert!(features.contains(&"channel-git".to_string()));
         let mut expected = resolve_feature_list(&root(), &Selection::Full).unwrap();
-        expected.extend(["channel-matrix", "channel-lark", "whatsapp-web"].map(str::to_owned));
+        expected.extend(
+            [
+                "channel-matrix",
+                "channel-lark",
+                "channel-git",
+                "whatsapp-web",
+            ]
+            .map(str::to_owned),
+        );
         expected.sort();
         expected.dedup();
         assert_eq!(features, expected);
@@ -1492,6 +1521,7 @@ mod tests {
             "distribution extras come from Cargo.toml registry"
         );
         assert!(extras.contains(&"channel-lark".to_string()));
+        assert!(extras.contains(&"channel-git".to_string()));
         assert!(extras.contains(&"whatsapp-web".to_string()));
     }
 
@@ -1556,7 +1586,9 @@ mod tests {
         .unwrap();
         assert_eq!(host, dist);
 
-        assert!(exclude_features(host, &["channel-slack".to_owned()]).is_err());
+        let outside_dist = features_outside_dist(&root()).unwrap();
+        let not_in_dist = outside_dist.first().expect("dist is not the kitchen sink");
+        assert!(exclude_features(host, std::slice::from_ref(not_in_dist)).is_err());
         let (target, excluded) = exclusions.iter().next().unwrap();
         let resolved =
             resolve_feature_list_for_target(&root(), &Selection::Dist, Some(target)).unwrap();
@@ -1596,6 +1628,34 @@ mod tests {
                 .unwrap();
         assert!(release.contains("features --selection dist --target \"${{ matrix.target }}\""));
         assert!(!release.contains("excluded_features"));
+        // The stable release build MUST pin --no-default-features against the
+        // generator's explicit per-target list, exactly like the manual workflow.
+        // Omitting it (or branching on an undefined matrix field) unions the root
+        // crate defaults back in and silently re-enables a target-excluded default
+        // feature (e.g. observability-prometheus on ARM). The excluded-feature
+        // string checks below do NOT catch that, since the leaked feature never
+        // appears as a literal in the workflow.
+        assert!(
+            release.contains(
+                "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target ${{ matrix.target }}"
+            ),
+            "the stable release build must pin --no-default-features so target-excluded default features cannot leak back in"
+        );
+        assert!(
+            !release.contains("skip_prometheus"),
+            "the stable release build must not branch on an undefined skip_prometheus matrix field"
+        );
+        let cross_install = "- name: Install cross (MUSL targets)\n        if: matrix.use_cross\n        run: bash scripts/ci/install_release_tool.sh cross";
+        assert!(release.contains(cross_install));
+        assert!(!release.contains("cargo install cross"));
+        assert_eq!(
+            release
+                .matches("run: bash scripts/ci/install_release_tool.sh tauri-cli")
+                .count(),
+            3,
+            "all three desktop release jobs must use the pinned installer"
+        );
+        assert!(!release.contains("cargo install tauri-cli"));
 
         let manual = std::fs::read_to_string(
             root().join(".github/workflows/cross-platform-build-manual.yml"),
@@ -1620,9 +1680,8 @@ mod tests {
                 "- os: ubuntu-latest\n            target: {target}\n            use_cross: true"
             )));
         }
-        assert!(manual.contains(
-            "- name: Install cross (MUSL targets)\n        if: matrix.use_cross\n        run: cargo install cross --version 0.2.5 --locked"
-        ));
+        assert!(manual.contains(cross_install));
+        assert!(!manual.contains("cargo install cross"));
         assert!(manual.contains(
             "if [ \"${{ matrix.use_cross || 'false' }}\" = \"true\" ]; then\n              echo \"BUILD_CMD=cross build\""
         ));
@@ -1636,12 +1695,15 @@ mod tests {
         assert!(manual.contains(
             "run: $BUILD_CMD --release --locked -p zerocode --target ${{ matrix.target }}"
         ));
+        assert!(manual.contains(
+            "run: $BUILD_CMD --release --locked -p zerorelay --target ${{ matrix.target }}"
+        ));
         assert_eq!(
             manual
                 .matches("if: matrix.target != 'aarch64-linux-android'")
                 .count(),
-            2,
-            "both the ZeroCode build and upload must skip Android"
+            4,
+            "the ZeroCode and ZeroRelay builds and uploads must all skip Android"
         );
         assert!(!manual.contains("excluded_features"));
 

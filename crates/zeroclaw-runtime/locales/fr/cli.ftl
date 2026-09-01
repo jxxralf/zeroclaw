@@ -26,7 +26,7 @@ cli-config-about = Gérer la configuration de ZeroClaw
 cli-update-about = Vérifier et appliquer les mises à jour de ZeroClaw
 cli-self-test-about = Exécuter les tests d'autodiagnostic
 cli-completions-about = Générer des scripts d'achèvement de shell
-cli-desktop-about = Lancer l'application de bureau companion ZeroClaw
+cli-desktop-about = Lancer l'application de bureau compagnon, ou ouvrir sa page de téléchargement
 cli-config-schema-about = Afficher le schéma JSON complet de la configuration sur stdout
 cli-config-list-about = Lister toutes les propriétés de configuration avec leurs valeurs actuelles
 cli-config-get-about = Obtenir la valeur d'une propriété de configuration
@@ -197,12 +197,12 @@ cli-cron-long-about =
 
     Exemples :
     zeroclaw cron list
-    zeroclaw cron add '0 9 * * 1-5' 'Bonjour' --tz America/New_York --agent
-    zeroclaw cron add '*/30 * * * *' 'Vérifier la santé du système' --agent
-    zeroclaw cron add '*/5 * * * *' 'echo ok'
-    zeroclaw cron add-at 2025-01-15T14:00:00Z 'Envoyer un rappel' --agent
-    zeroclaw cron add-every 60000 'Ping de santé'
-    zeroclaw cron once 30m 'Lancer une sauvegarde dans 30 minutes' --agent
+    zeroclaw cron add '0 9 * * 1-5' 'Bonjour' --agent sentinel --prompt --tz America/New_York
+    zeroclaw cron add '*/30 * * * *' 'Vérifier la santé du système' --agent sentinel --prompt
+    zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
+    zeroclaw cron add-at 2099-01-15T14:00:00Z 'Envoyer un rappel' --agent sentinel --prompt
+    zeroclaw cron add-every 60000 'Ping de santé' --agent sentinel --prompt
+    zeroclaw cron once 30m 'Lancer une sauvegarde dans 30 minutes' --agent sentinel --prompt
     zeroclaw cron pause IDENTIFIANT_TACHE
     zeroclaw cron update IDENTIFIANT_TACHE --expression '0 8 * * *' --tz Europe/London
 cli-channel-long-about =
@@ -319,11 +319,11 @@ cli-desktop-long-about =
 
     L'application compagnon est une application légère pour la barre de menu / zone de dénombrement du système qui se connecte au même pont que la CLI. Elle fournit un accès rapide au tableau de bord, à la supervision de l'état et à l'appairage des appareils.
 
-    Utilisez --install pour télécharger l'application compagnon pré-construite pour votre plateforme.
+    Utilisez --install pour ouvrir la page de téléchargement pour votre plateforme. Cela n'installe rien en soi.
 
     Exemples :
     zeroclaw desktop              # lancer l'application compagnon
-    zeroclaw desktop --install    # télécharger et l'installer
+    zeroclaw desktop --install    # ouvrir la page de téléchargement
 channel-needs-quickstart-reply = Cet agent n'est pas encore entièrement configuré. L'opérateur doit exécuter Quickstart avant que je puisse répondre.
 channel-whatsapp-web-feature-missing-warning = ⚠ WhatsApp Web est configuré mais la fonctionnalité 'whatsapp-web' n'est pas compilée.
 channel-whatsapp-web-feature-missing-build = Compilez/exécutez avec : cargo build --features whatsapp-web
@@ -375,6 +375,12 @@ channel-whatsapp-web-delivery-failure-note-many = (note : je n'ai pas pu livrer 
 channel-line-bind-success = ✅ Appairé ! Vous pouvez maintenant discuter.
 channel-line-bind-invalid-code = ❌ Code invalide. Veuillez réessayer.
 channel-line-bind-rate-limited = ⏳ Trop de tentatives. Réessayez dans { $secs }s.
+channel-telegram-cmd-new-desc = Démarrer une nouvelle session de conversation
+channel-telegram-cmd-clear-desc = Effacer cette session de conversation
+channel-telegram-cmd-stop-desc = Annuler la tâche en cours
+channel-telegram-cmd-model-desc = Afficher ou changer le modèle actuel
+channel-telegram-cmd-models-desc = Lister les fournisseurs de modèles disponibles ou changer de fournisseur
+channel-telegram-cmd-config-desc = Afficher la configuration actuelle
 onboard-openai-auth-note =
     Authentification OpenAI :
     • Clé API — accès API standard via platform.openai.com (sk-...)
@@ -428,11 +434,12 @@ cli-sop-none = Aucun SOP trouvé.
 cli-sop-pending-none = Aucune exécution SOP en attente d'approbation.
 cli-sop-pending-header = Exécutions SOP en attente d'approbation :
 cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] étape {$step}/{$total}
+cli-sop-status-failure-reason = Motif de l’échec : {$reason}
 cli-sop-ws-invalid-approval = sop approval_response requiert run_id et une décision approve ou deny
 cli-sop-ws-resolve-failed = échec de la résolution SOP : {$error}
 cli-sop-ws-engine-lock-poisoned = verrou du moteur SOP empoisonné
 cli-sop-ws-subsystem-disabled = sous-système SOP non activé
-cli-sop-create-hint = {"  "}Créez-en un : mkdir -p <workspace>/sops/my-sop
+cli-sop-create-hint = {"  "}Créez-en un : mkdir -p <shared>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}puis ajoutez SOP.toml et SOP.md
 cli-sop-loaded-header = SOP chargés ({$count}) :
 cli-sop-none-to-validate = Aucun SOP trouvé à valider.
@@ -482,7 +489,7 @@ cli-cron-added-oneshot = ✅ Tâche cron à exécution unique {$id} ajoutée
 cli-cron-added-interval-agent = ✅ Tâche cron d'agent par intervalle {$id} ajoutée
 cli-cron-added-interval = ✅ Tâche cron par intervalle {$id} ajoutée
 cli-cron-updated = ✅ Tâche cron {$id} mise à jour
-cli-cron-update-no-field = Au moins un des paramètres --expression, --tz, --command, --name, --allowed-tool ou --uses-memory doit être fourni
+cli-cron-update-no-field = Au moins un des paramètres --expression, --tz, --command, --name, --allowed-tool, --uses-memory ou une option de livraison (--channel, --to, --thread, --best-effort, --no-best-effort) doit être fourni
 cli-cron-removed = ✅ Tâche cron {$id} supprimée
 cli-cron-paused = ⏸️  Tâche cron {$id} en pause
 cli-cron-resumed = ▶️  Tâche cron {$id} reprise
@@ -498,6 +505,8 @@ cli-cron-cmd3 = {"  "}Cmd      : {$v}
 cli-cron-at = {"  "}À     : {$v}
 cli-cron-at2 = {"  "}À   : {$v}
 cli-cron-every = {"  "}Toutes(ms): {$v}
+cli-cron-delivery = {"  "}Livraison : {$v}
+cli-cron-delivery-disabled = désactivée (la sortie n'est envoyée nulle part)
 cli-no-command = Aucune commande fournie.
 cli-press-enter = Appuyez sur Entrée pour quitter...
 cli-quickstart-title = Quickstart — créez un agent fonctionnel de bout en bout.
@@ -599,6 +608,8 @@ cli-quickstart-error-channel-bound = le canal `{$reference}` est déjà lié à 
 cli-quickstart-error-channel-required = le type de canal et l'alias sont requis
 cli-quickstart-error-channel-field-not-advertised = le champ de canal `{$field}` n'est pas disponible dans Quickstart
 cli-quickstart-error-channel-token-required = le jeton du bot Telegram est requis
+cli-quickstart-error-webhook-secret-required = le secret partagé du webhook est requis
+cli-quickstart-error-webhook-port-conflict = le port webhook {$port} est déjà utilisé par le webhook activé `{$alias}` — chaque webhook activé doit avoir son propre port
 cli-quickstart-error-peer-group-name-required = le nom du groupe de pairs est requis
 cli-quickstart-error-peer-group-channel-required = la référence de canal du groupe de pairs est requise
 cli-quickstart-error-peer-group-unknown-channel = le groupe de pairs `{$name}` référence un canal inconnu `{$channel}`
@@ -659,9 +670,9 @@ cli-status-service-stopped = 🔴 Service :       arrêté
 cli-status-channels = Canaux :
 cli-status-cli-always = {"  "}CLI :      ✅ toujours
 cli-status-peripherals = Périphériques :
-cli-desktop-download = Téléchargez l'application compagnon ZeroClaw :
+cli-desktop-download = Ouverture de la page de téléchargement de l'application compagnon ZeroClaw :
 cli-desktop-homebrew = Ou installez via Homebrew (bientôt disponible) :
-cli-desktop-linux-pkg = {"  "}Téléchargez le fichier .deb ou .AppImage pour votre architecture.
+cli-desktop-linux-pkg = {"  "}La page propose des fichiers .deb et .AppImage selon l'architecture.
 cli-desktop-launching = Lancement de l'application compagnon ZeroClaw...
 cli-status-version = Version :     {$v}
 cli-status-workspace = Espace de travail :   {$v}
@@ -717,8 +728,8 @@ cli-plugin-install-resolving = Résolution de '{$source}' depuis le registre de 
 cli-plugin-installed-from = Plugin installé depuis {$source}
 cli-plugin-installed-name-version = Plugin {$name} v{$version} installé
 cli-plugin-config-entry-seeded = [[plugins.entries]] initialisé pour '{$name}'. Définissez les valeurs de configuration du plugin avec `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-key = Clé de configuration ({$capability}) : {$key}
 cli-plugin-config-entry-seed-skipped = avertissement : initialisation de l'entrée de configuration ignorée pour '{$name}' : la section [plugins] sur disque est mal formée. Réparez-la, ajoutez un bloc [[plugins.entries]] avec `name = "{$name}"`, puis définissez les valeurs avec `zeroclaw config set plugins.entries.{$name}.config.<key>`.
-cli-plugin-config-entry-seed-unaddressable = avertissement : initialisation de l'entrée de configuration ignorée pour '{$name}' : les noms de plugin contenant '.' ne peuvent pas être adressés par des chemins de configuration pointés (`config set` découpe sur '.'). Ajoutez manuellement un bloc [[plugins.entries]] avec `name = "{$name}"` au fichier de configuration.
 cli-config-section-degraded = avertissement : la section de configuration `{$section}` dans {$path} est mal formée et a été réinitialisée aux valeurs par défaut pour cette exécution. Les valeurs de cette section NE sont PAS appliquées. Exécutez `zeroclaw config migrate` pour voir l'erreur d'analyse, puis réparez le fichier.
 cli-plugin-removed = Plugin « {$name} » supprimé.
 cli-plugin-not-found = Plugin « {$name} » introuvable.
@@ -809,6 +820,12 @@ history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor}
 turn-ingress-dropped = Cette requête n'a pas été traitée : { $reason }
 turn-tool-interrupted-before-result = [interrompu par l'utilisateur avant que cet outil ne produise un résultat]
 channel-runtime-malformed-tool-output = J'ai généré une erreur de format d'appel d'outil interne et n'ai pas pu terminer cette requête. Veuillez réessayer.
+channel-runtime-progress-received = Reçu
+channel-runtime-progress-planning = Planification
+channel-runtime-progress-waiting-on-model = En attente du modèle
+channel-runtime-progress-running-tool = Exécution d’un outil
+channel-runtime-progress-compacting-context = Compactage du contexte
+channel-runtime-progress-finalizing-response = Finalisation de la réponse
 channel-runtime-new-session = Historique de conversation effacé. Nouveau départ.
 channel-runtime-stop-sent = Signal d'arrêt envoyé.
 channel-runtime-stop-no-task = Aucune tâche en cours pour ce périmètre d'expéditeur.
@@ -923,6 +940,13 @@ cli-gateway-restart-hint-process = redémarrez le processus `zeroclaw daemon`
 
 cli-daemon-gateway-already-running = Une passerelle ZeroClaw est déjà en cours d'exécution sur {$host}:{$port}. Le démon supervise sa propre passerelle et ne démarrera pas une seconde passerelle sur la même adresse. Arrêtez cette passerelle (ou pointez le démon vers un port libre avec `zeroclaw config set gateway.port <port>`), puis relancez le démon.
 cli-daemon-gateway-port-occupied = L'adresse de passerelle {$host}:{$port} est déjà utilisée par un autre processus. Libérez le port ou pointez le démon vers un port libre (`zeroclaw config set gateway.port <port>`), puis relancez le démon.
+cli-daemon-starting-title = 🧠 Le démon ZeroClaw démarre…
+cli-daemon-starting-detail = Préparation des endpoints configurés du démon
+cli-daemon-started-title = 🧠 Le démon ZeroClaw est prêt
+cli-daemon-started-gateway = Passerelle : {$url}
+cli-daemon-started-socket = Socket :     {$path}
+cli-daemon-started-pairing = Appairage : activé (voir ci-dessus l'état actuel de la passerelle)
+cli-daemon-started-stop = Ctrl+C ou SIGTERM pour arrêter
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: inconnu / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: a déjà context_window = {$ctx}
@@ -935,6 +959,13 @@ cli-doctor-ctxwin-saved = {$updated} mise(s) à jour enregistrée(s) dans config
 cli-doctor-ctxwin-dry-run = Simulation terminée — aucun changement. Relancez sans --dry-run pour appliquer.
 cli-doctor-ctxwin-none = Aucune mise à jour nécessaire.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: échec de l'écriture de context_window: {$error}
+cli-doctor-context-window-ok = {$provider_ref} : fenêtre de contexte : {$context_window} jetons
+cli-doctor-context-window-zero = {$provider_ref} : context_window vaut 0 (invalide ; définissez la limite de contexte réelle du modèle)
+cli-doctor-context-window-unset = {$provider_ref} : aucun context_window défini — utilisera la valeur de repli de {$fallback} jetons lorsqu'il sera sélectionné ; probablement bien inférieure à la limite réelle de ce modèle ; définissez context_window sur ce profil
+
+# Doctor probe timeout warning — shown when model probing times out but prior
+# diagnostics (config, workspace, daemon) are preserved and returned.
+cli-doctor-probe-timeout-message = La vérification des modèles a expiré. Certains catalogues de fournisseurs peuvent être inaccessibles. Vous pouvez réexécuter Doctor pour actualiser.
 
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = La section de configuration CRITIQUE POUR LA SÉCURITÉ `{$path}` est invalide et a été réinitialisée à sa valeur par défaut pour permettre au daemon de démarrer ; la posture en cours d'exécution peut être PLUS FAIBLE que prévu. Exécutez `zeroclaw config migrate` pour voir l'erreur d'analyse, puis réparez le fichier.
@@ -945,6 +976,11 @@ sop-rpc-decision-invalid-state = L’exécution {$run_id} ne peut pas être rés
 sop-rpc-decision-unauthorized = L’identité RPC n’est pas autorisée à résoudre cette étape SOP.
 sop-rpc-policy-missing = La politique d’approbation SOP « {$name} » n’est pas configurée.
 sop-rpc-policy-unavailable = La politique du SOP en attente est indisponible : {$reason}.
+
+# ── Approbation des outils dans le terminal ──
+# Les raccourcis ASCII restent alignés sur l'analyseur de réponses Rust.
+cli-approval-request = 🔧 L'agent veut exécuter : {$tool}
+cli-approval-prompt = { "   " }[Y] Oui / [N] Non / [A] Toujours pour {$tool} :{ " " }
 
 # ── Tool approval (channels, #9409) ──
 # Human-visible copy for the operator-facing tool-approval prompt, shared
@@ -964,10 +1000,13 @@ channel-approval-btn-always = Toujours
 channel-approval-tap-instruction = Appuyez sur un bouton ci-dessous :
 channel-approval-reply-instruction-yesno = Répondez : "{ $yes_command }", "{ $no_command }" ou "{ $always_command }"
 channel-approval-reply-instruction-approve-deny = Répondez par `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`.
+channel-approval-group-visibility-warning =
+    Il s'agit d'une discussion de groupe : tout le monde ici peut voir ce code et les arguments de l'outil affichés ci-dessus. Seul un pair autorisé de ce canal peut répondre.
 channel-telegram-approval-ack-approved = Approuvé
 channel-telegram-approval-ack-always-approved = Toujours approuvé
 channel-telegram-approval-ack-denied = Refusé
 channel-telegram-approval-ack-unknown = Action inconnue
+channel-telegram-approval-ack-already-resolved = Approbation déjà résolue
 channel-discord-approval-btn-allow-once = Autoriser une fois
 channel-discord-approval-btn-allow-session = Autoriser pour cette session
 channel-discord-approval-btn-allow-always = Toujours autoriser
@@ -976,3 +1015,21 @@ channel-approval-opt-allow-once = Autoriser une fois
 channel-approval-opt-allow-always = Toujours autoriser
 channel-approval-opt-reject = Rejeter
 channel-approval-opt-reject-with-edit = Rejeter avec modification
+cli-agent-error-provider-context-window = La requête est trop volumineuse pour le modèle sélectionné. Réduisez la conversation ou choisissez un modèle avec une fenêtre de contexte plus grande.
+cli-agent-error-provider-credentials-missing = Le fournisseur de modèle sélectionné n'a aucun identifiant configuré. Ajoutez sa clé API ou choisissez un autre fournisseur.
+cli-agent-error-provider-credentials-missing-named = Le fournisseur de modèle {$provider} n'a aucun identifiant configuré. Ajoutez sa clé API ou choisissez un autre fournisseur.
+cli-agent-error-provider-authentication = Le fournisseur de modèle sélectionné a refusé ses identifiants. Vérifiez les identifiants configurés.
+cli-agent-error-provider-authentication-named = Le fournisseur de modèle {$provider} a refusé ses identifiants. Vérifiez les identifiants configurés.
+cli-agent-error-provider-rate-limited = Le fournisseur de modèle sélectionné a limité la requête. Attendez, vérifiez le quota ou choisissez un autre fournisseur.
+cli-agent-error-provider-server = Le fournisseur de modèle sélectionné a renvoyé une erreur serveur. Réessayez ou choisissez un autre fournisseur.
+cli-agent-error-provider-model-not-found = Le modèle sélectionné est indisponible. Vérifiez le nom de modèle configuré.
+cli-agent-error-provider-client-request = Le fournisseur de modèle sélectionné a refusé la requête. Vérifiez la configuration du fournisseur et la requête.
+cli-agent-error-provider-connection-local = Le serveur de modèle local à {$endpoint} est indisponible. Démarrez-le ou mettez à jour le point de terminaison.
+cli-agent-error-provider-connection-remote = Impossible d'atteindre le fournisseur de modèle à {$endpoint}. Vérifiez l'accès réseau ou choisissez un autre fournisseur.
+cli-agent-error-provider-connection = Impossible d'atteindre le fournisseur de modèle sélectionné. Vérifiez l'accès réseau ou choisissez un autre fournisseur.
+cli-agent-error-provider-timeout = Le fournisseur de modèle sélectionné a expiré. Réessayez ou choisissez un autre fournisseur.
+cli-agent-error-provider-generic = Le fournisseur de modèle sélectionné a échoué. Vérifiez la configuration du fournisseur ou choisissez un autre fournisseur.
+cli-delegate-error-invalid-semantic-completion = L'agent '{$agent_name}' a échoué : le fournisseur de modèle a renvoyé une réponse sémantique non valide.
+cli-agent-error-invalid-semantic-completion = Le fournisseur de modèle a renvoyé une réponse sémantique non valide.
+cli-delegate-error-incomplete-after-provider-tools = L'agent '{$agent_name}' a échoué : le fournisseur de modèle s'est arrêté après l'exécution des outils sans fournir de réponse finale.
+cli-agent-error-incomplete-after-provider-tools = Le fournisseur de modèle s'est arrêté après l'exécution des outils sans fournir de réponse finale.

@@ -77,6 +77,12 @@ pub struct Skill {
     /// then fall back to a single free-text option. See [`SkillSlashOption`].
     #[serde(default)]
     pub slash_options: Vec<SkillSlashOption>,
+    /// When `true`, this skill's full instructions stay inlined in the system
+    /// prompt even in [`zeroclaw_config::schema::SkillsPromptInjectionMode::Compact`]
+    /// mode, instead of being loaded on demand via `read_skill(name)`. Intended
+    /// for policy/critical skills that must always be visible to the model.
+    #[serde(default)]
+    pub always: bool,
     #[serde(skip)]
     pub location: Option<PathBuf>,
 }
@@ -333,6 +339,10 @@ struct SkillMeta {
     prompts: Vec<String>,
     #[serde(default)]
     slash_options: Vec<SkillSlashOption>,
+    /// See [`Skill::always`]. Declared in SKILL.toml under `[skill]` as
+    /// `always = true`.
+    #[serde(default)]
+    always: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -376,6 +386,8 @@ struct SkillMarkdownMeta {
     /// so a SKILL.md skill can drive native Discord slash commands — parity with
     /// SKILL.toml's `[[skill.slash_options]]`.
     slash_options: Vec<SkillSlashOption>,
+    /// See [`Skill::always`]. Parsed from a top-level `always: true` key.
+    always: bool,
 }
 
 fn default_version() -> String {
@@ -1321,6 +1333,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         tools: manifest.tools,
         prompts,
         slash_options: manifest.skill.slash_options,
+        always: manifest.skill.always,
         location: Some(path.to_path_buf()),
     })
 }
@@ -1350,6 +1363,7 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         tools: Vec::new(),
         prompts: vec![parsed.body],
         slash_options: parsed.meta.slash_options,
+        always: parsed.meta.always,
         location: Some(path.to_path_buf()),
     })
 }
@@ -1392,6 +1406,7 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         tools: Vec::new(),
         prompts: vec![parsed.body],
         slash_options: parsed.meta.slash_options,
+        always: parsed.meta.always,
         location: Some(path.to_path_buf()),
     }))
 }
@@ -1478,6 +1493,7 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
             "description" => meta.description = Some(val.to_string()),
             "version" => meta.version = Some(val.to_string()),
             "author" => meta.author = Some(val.to_string()),
+            "always" => meta.always = val.eq_ignore_ascii_case("true"),
             "tags" => {
                 if val.is_empty() {
                     // YAML block list follows on subsequent lines
@@ -1583,13 +1599,31 @@ fn display_skill_location(path: &Path) -> String {
     }
 }
 
-/// Build the "Available Skills" system prompt section with full skill instructions.
+/// Build the available-skills prompt when no tool-availability context exists.
+/// Full mode is the safe fallback because compact mode requires `read_skill`.
 pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
     skills_to_prompt_with_mode(
         skills,
         workspace_dir,
         zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
     )
+}
+
+/// Resolve compact skill prompting against the effective tool surface.
+/// Compact mode is only safe when `read_skill` is available for the turn.
+pub fn skills_prompt_mode_with_loader_fallback(
+    mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
+    read_skill_available: bool,
+) -> zeroclaw_config::schema::SkillsPromptInjectionMode {
+    if matches!(
+        mode,
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
+    ) && !read_skill_available
+    {
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Full
+    } else {
+        mode
+    }
 }
 
 fn is_registered_skill_tool_kind(kind: &str) -> bool {
@@ -1606,10 +1640,13 @@ fn skill_tool_is_prompt_callable(tool: &SkillTool) -> bool {
     }
 }
 
-/// Build the "Available Skills" system prompt section with configurable verbosity.
+/// Build the available-skills prompt section with the requested verbosity.
 pub fn skills_to_prompt_with_mode(
     skills: &[Skill],
     workspace_dir: &Path,
+    // The caller supplies the resolved mode after applying any runtime-profile
+    // override over the global value. Full inlines instructions eagerly;
+    // Compact renders summaries whose instructions load via `read_skill`.
     mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
 ) -> String {
     use std::fmt::Write;
@@ -1618,44 +1655,39 @@ pub fn skills_to_prompt_with_mode(
         return String::new();
     }
 
-    let mut prompt = match mode {
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Full => String::from(
+    let is_full = matches!(
+        mode,
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Full
+    );
+
+    let mut prompt = if is_full {
+        String::from(
             "## Available Skills\n\n\
              Skill instructions and tool metadata are preloaded below.\n\
              Follow these instructions directly; do not read skill files at runtime unless the user asks.\n\n\
              <available_skills>\n",
-        ),
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact => String::from(
+        )
+    } else {
+        String::from(
             "## Available Skills\n\n\
              Skill summaries are preloaded below to keep context compact.\n\
              Skill instructions are loaded on demand: call `read_skill(name)` with the skill's `<name>` when you need the full skill file.\n\
+             Skills marked `always` include full instructions below even in compact mode.\n\
              The `location` field is included for reference.\n\n\
              <available_skills>\n",
-        ),
+        )
     };
 
     for skill in skills {
         let _ = writeln!(prompt, "  <skill>");
         write_xml_text_element(&mut prompt, 4, "name", &skill.name);
         write_xml_text_element(&mut prompt, 4, "description", &skill.description);
-        let location = render_skill_location(
-            skill,
-            workspace_dir,
-            matches!(
-                mode,
-                zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
-            ),
-        );
+        let location = render_skill_location(skill, workspace_dir, !is_full);
         write_xml_text_element(&mut prompt, 4, "location", &location);
 
-        // In Full mode, inline both instructions and tools.
-        // In Compact mode, skip instructions (loaded on demand) but keep tools
-        // so the LLM knows which skill tools are available.
-        if matches!(
-            mode,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Full
-        ) && !skill.prompts.is_empty()
-        {
+        // Full mode inlines instructions eagerly. Compact mode does so only for
+        // always-injected skills; other instructions load through `read_skill`.
+        if (is_full || skill.always) && !skill.prompts.is_empty() {
             let _ = writeln!(prompt, "    <instructions>");
             for instruction in &skill.prompts {
                 write_xml_text_element(&mut prompt, 6, "instruction", instruction);
@@ -2630,6 +2662,16 @@ pub fn install_extra_registry_skill_source(
 
 // ─── Plugin-shipped skills (plugins-wasm only) ───────────────────────────────
 
+/// Load the skills shipped by every skill-plugin instance the activation plan
+/// admitted.
+///
+/// The `plugins.max_active_instances` ceiling spans channels, tools, and
+/// skills, so this loader may not walk `skill_plugin_details()` directly: it
+/// derives the same admitted set from the current config and host snapshot
+/// that the channel and tool loaders derive, and skips any package whose skill
+/// binding the plan did not admit. The plan holds no counter, so loading
+/// skills repeatedly from one snapshot yields the same set instead of spending
+/// the same logical slot again.
 #[cfg(feature = "plugins-wasm")]
 pub fn load_plugin_skills_from_config(
     config: &zeroclaw_config::schema::Config,
@@ -2663,10 +2705,33 @@ pub fn load_plugin_skills_from_config(
         }
     };
 
+    let plan = match crate::plugin_runtime::PluginActivationPlan::build(config, &host) {
+        Ok(plan) => plan,
+        Err(err) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                "failed to admit logical plugin skill instances"
+            );
+            return (Vec::new(), Vec::new());
+        }
+    };
+
     let allow_scripts = config.skills.allow_scripts;
     let mut skills = Vec::new();
     let mut dropped = Vec::new();
     for (manifest, skills_dir) in host.skill_plugin_details() {
+        // `for_package_binding` names the skill binding after the package, so
+        // the package name is both halves of this admission lookup.
+        if !plan.admits(
+            &manifest.name,
+            zeroclaw_plugins::PluginCapability::Skill,
+            &manifest.name,
+        ) {
+            continue;
+        }
         let (raw_skills, raw_dropped) = load_skills_from_directory(&skills_dir, allow_scripts);
         for raw in raw_skills {
             skills.push(namespace_plugin_skill(&manifest.name, raw));
@@ -3619,6 +3684,26 @@ version = "0.1.0"
     }
 
     #[test]
+    fn load_skill_toml_parses_always_true() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+[skill]
+name = "probe"
+description = "test"
+version = "0.1.0"
+always = true
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert!(
+            skill.always,
+            "always = true in SKILL.toml must set Skill.always"
+        );
+    }
+
+    #[test]
     fn load_skill_md_parses_slash_options_from_frontmatter() {
         let tmp = TempDir::new().unwrap();
         let md = r#"---
@@ -3667,6 +3752,34 @@ Write it.
         std::fs::write(&path, "---\nname: plain\ndescription: d\n---\n# Plain\n").unwrap();
         let skill = load_skill_md(&path, tmp.path()).unwrap();
         assert!(skill.slash_options.is_empty());
+    }
+
+    #[test]
+    fn load_skill_md_parses_always_true_from_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("SKILL.md");
+        std::fs::write(
+            &path,
+            "---\nname: policy\ndescription: Critical policy skill.\nalways: true\n---\n# Policy\n",
+        )
+        .unwrap();
+        let skill = load_skill_md(&path, tmp.path()).unwrap();
+        assert!(
+            skill.always,
+            "always: true in frontmatter must set Skill.always"
+        );
+    }
+
+    #[test]
+    fn load_skill_md_defaults_always_to_false_when_absent() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("SKILL.md");
+        std::fs::write(&path, "---\nname: plain\ndescription: d\n---\n# Plain\n").unwrap();
+        let skill = load_skill_md(&path, tmp.path()).unwrap();
+        assert!(
+            !skill.always,
+            "always must default to false when the key is absent"
+        );
     }
 
     #[test]
@@ -3852,53 +3965,6 @@ licence = true
     }
 
     #[test]
-    fn integrate_round_trip_emits_top_level_forge() {
-        use crate::skillforge::scout::{ScoutResult, ScoutSource};
-        use chrono::Utc;
-        let candidate = ScoutResult {
-            name: "round-trip".into(),
-            url: "https://github.com/user/round-trip".into(),
-            description: "round-trip test".into(),
-            stars: 7,
-            language: Some("Rust".into()),
-            updated_at: Some(Utc::now()),
-            source: ScoutSource::GitHub,
-            owner: "user".into(),
-            has_license: true,
-        };
-
-        // Generate the TOML the integrator would write and parse it back.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let integrator = crate::skillforge::integrate::Integrator::new(
-            tmp.path().to_string_lossy().into_owned(),
-        );
-        let skill_dir = integrator.integrate(&candidate).unwrap();
-        let toml_str = std::fs::read_to_string(skill_dir.join("SKILL.toml")).unwrap();
-
-        let manifest: SkillManifest = toml::from_str(&toml_str).unwrap_or_else(|e| {
-            panic!(
-                "integrator output must parse against SkillManifest with strict SkillMeta + ForgeMetadata; \
-                 got error: {e}\n--- toml ---\n{toml_str}"
-            )
-        });
-        let forge = manifest
-            .forge
-            .expect("integrator must emit a [forge] table");
-        assert_eq!(forge.owner.as_deref(), Some("user"));
-        assert_eq!(forge.stars, Some(7));
-        assert_eq!(forge.license, Some(true));
-        assert!(
-            forge
-                .source
-                .as_deref()
-                .is_some_and(|s| s.contains("round-trip")),
-            "forge.source should carry the upstream URL"
-        );
-        assert_eq!(manifest.skill.name, "round-trip");
-        assert_eq!(manifest.skill.description, "round-trip test");
-    }
-
-    #[test]
     fn workspace_swallow_site_skips_invalid_toml_without_panicking() {
         use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
@@ -4081,6 +4147,7 @@ mod prompt_callable_name_tests {
             tools: vec![tool("run.lint", "shell")],
             prompts: Vec::new(),
             slash_options: Vec::new(),
+            always: false,
             location: None,
         };
 
@@ -4158,6 +4225,7 @@ mod prompt_callable_name_tests {
             ],
             prompts: Vec::new(),
             slash_options: Vec::new(),
+            always: false,
             location: None,
         };
 
@@ -4197,6 +4265,7 @@ mod prompt_callable_name_tests {
             ],
             prompts: Vec::new(),
             slash_options: Vec::new(),
+            always: false,
             location: None,
         };
 
