@@ -1193,20 +1193,18 @@ async fn agent_turn_with_sop_reassembly(
     // `snapshot_turn_usage` prefers the caller-scoped task-local and may
     // report the parent turn's cumulative usage — pre-existing cost
     // attribution semantics, kept as-is.
-    let tokens_used = TOOL_LOOP_COST_TRACKING_CONTEXT
+    let turn_usage = TOOL_LOOP_COST_TRACKING_CONTEXT
         .try_with(std::clone::Clone::clone)
         .ok()
         .flatten()
-        .and_then(|ctx| {
-            let usage = ctx.snapshot_turn_usage();
-            (usage.input_tokens > 0 || usage.output_tokens > 0).then_some(
-                zeroclaw_api::observability_traits::TurnTokenUsage {
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                },
-            )
-        });
-    turn_guard.set_usage(tokens_used, None);
+        .map(|ctx| ctx.snapshot_turn_usage())
+        .filter(|usage| !usage.is_zero());
+    let tokens_used = turn_usage.map(|usage| zeroclaw_api::observability_traits::TurnTokenUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+    });
+    let turn_cost_usd = turn_usage.map(|usage| usage.cost_usd);
+    turn_guard.set_usage(tokens_used, turn_cost_usd);
     turn_guard.finish();
     result
 }
@@ -3195,17 +3193,18 @@ pub async fn run(
             }
         }
 
-        let tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
-            let usage = ctx.snapshot_turn_usage();
-            (usage.input_tokens > 0 || usage.output_tokens > 0).then_some(
-                zeroclaw_api::observability_traits::TurnTokenUsage {
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                },
-            )
-        });
+        let turn_usage = cost_tracking_context
+            .as_ref()
+            .map(|ctx| ctx.snapshot_turn_usage())
+            .filter(|usage| !usage.is_zero());
+        let tokens_used =
+            turn_usage.map(|usage| zeroclaw_api::observability_traits::TurnTokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            });
+        let turn_cost_usd = turn_usage.map(|usage| usage.cost_usd);
         turn_guard.set_model_route(provider_name.clone(), model_name.clone());
-        turn_guard.set_usage(tokens_used, None);
+        turn_guard.set_usage(tokens_used, turn_cost_usd);
         turn_guard.finish();
 
         Ok(final_output)

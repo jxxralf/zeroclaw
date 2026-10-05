@@ -27,6 +27,15 @@ pub struct TurnUsage {
     pub last_input_tokens: u64,
 }
 
+impl TurnUsage {
+    /// True when no tokens were billed and no cost was recorded. Used to
+    /// skip emitting empty `AgentEnd` annotations when the turn produced
+    /// no observable usage (e.g. a turn that returned early on error).
+    pub fn is_zero(&self) -> bool {
+        self.input_tokens == 0 && self.output_tokens == 0 && self.cost_usd == 0.0
+    }
+}
+
 pub fn build_model_provider_pricing(config: &Config) -> ModelProviderPricing {
     let mut pricing: ModelProviderPricing = HashMap::new();
 
@@ -657,6 +666,23 @@ mod tests {
     use zeroclaw_config::schema::{Config, DeepseekModelProviderConfig, ModelProviderConfig};
     use zeroclaw_providers::ProviderDispatch;
     use zeroclaw_providers::dispatch::{AccountedChatScope, with_exact_dispatch_route};
+
+    #[test]
+    fn turn_usage_is_zero_skips_empty_usage() {
+        assert!(TurnUsage::default().is_zero());
+
+        let token_only = TurnUsage {
+            input_tokens: 1,
+            ..TurnUsage::default()
+        };
+        assert!(!token_only.is_zero());
+
+        let cost_only = TurnUsage {
+            cost_usd: 0.001,
+            ..TurnUsage::default()
+        };
+        assert!(!cost_only.is_zero());
+    }
 
     struct ResetGlobalPricingCatalog;
 
