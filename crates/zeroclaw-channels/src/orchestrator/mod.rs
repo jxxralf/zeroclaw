@@ -10221,7 +10221,7 @@ async fn process_channel_message_body(
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
         });
-    let turn_cost_usd = turn_usage.map(|usage| usage.cost_usd);
+    let turn_cost_usd = turn_usage.and_then(|usage| usage.complete_cost());
     turn_guard.set_model_route(route.model_provider.clone(), route.model.clone());
     turn_guard.set_usage(turn_tokens_used, turn_cost_usd);
     turn_guard.finish();

@@ -25,6 +25,9 @@ pub struct TurnUsage {
     pub output_tokens: u64,
     pub cost_usd: f64,
     pub last_input_tokens: u64,
+    /// Token subset that could not be priced. When non-zero, `cost_usd` is
+    /// an incomplete total and must not be published as a complete cost.
+    pub unpriced_tokens: u64,
 }
 
 impl TurnUsage {
@@ -33,6 +36,13 @@ impl TurnUsage {
     /// no observable usage (e.g. a turn that returned early on error).
     pub fn is_zero(&self) -> bool {
         self.input_tokens == 0 && self.output_tokens == 0 && self.cost_usd == 0.0
+    }
+
+    /// The turn's cost, or `None` when any token-bearing usage could not be
+    /// priced and `cost_usd` is therefore an incomplete total. Preserves
+    /// `Some(0.0)` for fully priced, genuinely free usage.
+    pub fn complete_cost(&self) -> Option<f64> {
+        (self.unpriced_tokens == 0).then_some(self.cost_usd)
     }
 }
 
@@ -554,6 +564,7 @@ fn record_tool_loop_cost_usage_inner_with_live(
             usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
             usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
             usage.cost_usd += cost_usage.cost_usd;
+            usage.unpriced_tokens = usage.unpriced_tokens.saturating_add(unpriced.tokens);
             if updates_context_window_fill {
                 // Replace (not accumulate) last_input_tokens with the absolute
                 // accepted provider-reported prompt size — this is the accurate
@@ -570,6 +581,7 @@ fn record_tool_loop_cost_usage_inner_with_live(
         turn_usage.input_tokens = turn_usage.input_tokens.saturating_add(input_tokens);
         turn_usage.output_tokens = turn_usage.output_tokens.saturating_add(output_tokens);
         turn_usage.cost_usd += cost_usage.cost_usd;
+        turn_usage.unpriced_tokens = turn_usage.unpriced_tokens.saturating_add(unpriced.tokens);
         if updates_context_window_fill {
             // Replace (not accumulate) last_input_tokens with the absolute
             // accepted provider-reported prompt size.
@@ -682,6 +694,37 @@ mod tests {
             ..TurnUsage::default()
         };
         assert!(!cost_only.is_zero());
+    }
+
+    #[test]
+    fn turn_usage_complete_cost_preserves_pricing_completeness() {
+        // Fully priced, known non-zero cost.
+        let known = TurnUsage {
+            cost_usd: 0.042,
+            ..TurnUsage::default()
+        };
+        assert_eq!(known.complete_cost(), Some(0.042));
+
+        // Fully priced but genuinely free usage stays Some(0.0).
+        let free = TurnUsage::default();
+        assert_eq!(free.complete_cost(), Some(0.0));
+
+        // Missing pricing: tokens recorded but no price → None, not Some(0.0).
+        let missing = TurnUsage {
+            input_tokens: 100,
+            unpriced_tokens: 100,
+            ..TurnUsage::default()
+        };
+        assert_eq!(missing.complete_cost(), None);
+
+        // Mixed/partial pricing: some tokens priced, some not → None.
+        let partial = TurnUsage {
+            input_tokens: 200,
+            cost_usd: 0.01,
+            unpriced_tokens: 100,
+            ..TurnUsage::default()
+        };
+        assert_eq!(partial.complete_cost(), None);
     }
 
     struct ResetGlobalPricingCatalog;

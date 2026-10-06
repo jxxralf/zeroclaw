@@ -4003,7 +4003,7 @@ impl Agent {
                     input_tokens: usage.input_tokens,
                     output_tokens: usage.output_tokens,
                 }),
-                Some(usage.cost_usd),
+                usage.complete_cost(),
             );
         }
         // Write back any token-budget trim that happened inside the loop to
@@ -4604,7 +4604,7 @@ impl Agent {
                         input_tokens: usage.input_tokens,
                         output_tokens: usage.output_tokens,
                     }),
-                    Some(usage.cost_usd),
+                    usage.complete_cost(),
                 );
             }
 

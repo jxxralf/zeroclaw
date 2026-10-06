@@ -1203,7 +1203,7 @@ async fn agent_turn_with_sop_reassembly(
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
     });
-    let turn_cost_usd = turn_usage.map(|usage| usage.cost_usd);
+    let turn_cost_usd = turn_usage.and_then(|usage| usage.complete_cost());
     turn_guard.set_usage(tokens_used, turn_cost_usd);
     turn_guard.finish();
     result
@@ -3202,7 +3202,7 @@ pub async fn run(
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
             });
-        let turn_cost_usd = turn_usage.map(|usage| usage.cost_usd);
+        let turn_cost_usd = turn_usage.and_then(|usage| usage.complete_cost());
         turn_guard.set_model_route(provider_name.clone(), model_name.clone());
         turn_guard.set_usage(tokens_used, turn_cost_usd);
         turn_guard.finish();
