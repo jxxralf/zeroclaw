@@ -727,6 +727,121 @@ mod tests {
         assert_eq!(partial.complete_cost(), None);
     }
 
+    #[derive(Default)]
+    struct CapturingObserver {
+        events: parking_lot::Mutex<Vec<zeroclaw_api::observability_traits::ObserverEvent>>,
+    }
+
+    impl zeroclaw_api::observability_traits::Observer for CapturingObserver {
+        fn record_event(&self, event: &zeroclaw_api::observability_traits::ObserverEvent) {
+            self.events.lock().push(event.clone());
+        }
+        fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+        fn name(&self) -> &str {
+            "capturing"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn agent_end_cost_reflects_pricing_completeness() {
+        // Drive usage through the production recorder, then emit AgentEnd the
+        // way the runtime/channel call sites do, and assert the emitted cost.
+        // Known pricing → Some(cost); fully priced free → Some(0.0); missing
+        // or partial pricing → None.
+        type Case = (
+            &'static str,
+            &'static str,
+            HashMap<String, f64>,
+            Option<f64>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "known",
+                "known-model",
+                pricing_with_cache("known-model", 2.0, 0.0, 5.0),
+                Some((100.0 * 2.0 + 20.0 * 5.0) / 1_000_000.0),
+            ),
+            (
+                "free",
+                "free-model",
+                pricing_with_cache("free-model", 0.0, 0.0, 0.0),
+                Some(0.0),
+            ),
+            ("missing", "missing-model", HashMap::new(), None),
+            (
+                "partial",
+                "partial-model",
+                HashMap::from([("partial-model.input".to_string(), 2.0)]),
+                None,
+            ),
+        ];
+
+        for (provider, model, pricing, expected_cost) in cases {
+            let workspace = tempfile::TempDir::new().unwrap();
+            let tracker = Arc::new(
+                CostTracker::new(
+                    zeroclaw_config::schema::CostConfig::default(),
+                    workspace.path(),
+                )
+                .unwrap(),
+            );
+            let ctx = ToolLoopCostTrackingContext::new(
+                Arc::clone(&tracker),
+                Arc::new(HashMap::from([(provider.to_string(), pricing)])),
+            );
+            let usage = zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                cached_input_tokens: Some(0),
+                cache_creation_input_tokens: None,
+            };
+
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(
+                    TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx.clone()), async {
+                        record_tool_loop_cost_usage(provider, model, &usage)
+                    }),
+                )
+                .expect("usage recorded");
+
+            // Emit AgentEnd exactly as the runtime/channel call sites do.
+            let observer = CapturingObserver::default();
+            let turn_usage = ctx.snapshot_turn_usage();
+            let tokens_used = (!turn_usage.is_zero()).then_some({
+                zeroclaw_api::observability_traits::TurnTokenUsage {
+                    input_tokens: turn_usage.input_tokens,
+                    output_tokens: turn_usage.output_tokens,
+                }
+            });
+            let mut guard = crate::observability::AgentTurnGuard::start(
+                &observer, provider, model, None, None, None,
+            );
+            guard.set_usage(tokens_used, turn_usage.complete_cost());
+            guard.finish();
+
+            let cost = observer.events.lock().iter().find_map(|event| match event {
+                zeroclaw_api::observability_traits::ObserverEvent::AgentEnd {
+                    cost_usd, ..
+                } => *cost_usd,
+                _ => None,
+            });
+            match (cost, expected_cost) {
+                (Some(actual), Some(expected)) => assert!(
+                    (actual - expected).abs() < 1e-12,
+                    "{provider}/{model}: {actual} != {expected}"
+                ),
+                (None, None) => {}
+                (actual, expected) => {
+                    panic!("{provider}/{model}: got {actual:?}, expected {expected:?}")
+                }
+            }
+        }
+    }
+
     struct ResetGlobalPricingCatalog;
 
     impl Drop for ResetGlobalPricingCatalog {
