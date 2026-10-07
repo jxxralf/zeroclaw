@@ -4202,7 +4202,9 @@ impl SecurityPolicy {
         if self.file_read_allowed_patterns.is_empty() {
             return true;
         }
-        let path_str = resolved.to_string_lossy();
+        // Normalize Windows separators (`\`) to the `/` the patterns use, so
+        // a `**/SKILL.md` pattern matches on both platforms.
+        let path_str = resolved.to_string_lossy().replace('\\', "/");
         let options = glob::MatchOptions {
             case_sensitive: true,
             require_literal_separator: true,
@@ -10424,5 +10426,18 @@ mod tests {
         assert!(!p_allow_null.is_file_read_pattern_allowed(Path::new("/dev/zero")));
 
         assert!(pattern_policy(Vec::new()).is_file_read_pattern_allowed(Path::new("/dev/null")));
+    }
+
+    #[test]
+    fn is_file_read_pattern_allowed_normalizes_windows_separators() {
+        let p = pattern_policy(vec!["**/SKILL.md".into()]);
+        assert!(
+            p.is_file_read_pattern_allowed(Path::new(r"C:\Users\u\.zeroclaw\skills\foo\SKILL.md"))
+        );
+        assert!(
+            !p.is_file_read_pattern_allowed(Path::new(
+                r"C:\Users\u\.zeroclaw\skills\foo\notes.txt"
+            ))
+        );
     }
 }
