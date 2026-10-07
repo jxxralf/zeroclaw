@@ -7432,16 +7432,16 @@ fn compute_max_in_flight_messages(
 ) -> usize {
     // Single defensive choke point for the in-flight budget. It computes the
     // natural budget (`channel_count × per_channel`) and normalizes
-    // out-of-domain config (min > max, zeros, values beyond the global
-    // ceiling) so a config that slips past validation cannot panic `clamp`,
-    // build a zero-permit semaphore, or exceed the designed cap.
+    // out-of-domain config so a config that slips past validation cannot
+    // panic `clamp`, build a zero-permit semaphore, or exceed the global
+    // ceiling. `max_in_flight_messages` is the hard cap: when an inverted
+    // range (`min > max`) arrives, the configured maximum wins and the
+    // floor collapses to it.
+    let hi =
+        max_in_flight_messages.clamp(1, zeroclaw_config::schema::CHANNEL_MAX_IN_FLIGHT_MESSAGES);
     let lo = min_in_flight_messages
-        .min(max_in_flight_messages)
-        .clamp(1, zeroclaw_config::schema::CHANNEL_MAX_IN_FLIGHT_MESSAGES);
-    let hi = min_in_flight_messages
-        .max(max_in_flight_messages)
         .clamp(1, zeroclaw_config::schema::CHANNEL_MAX_IN_FLIGHT_MESSAGES)
-        .max(lo);
+        .min(hi);
     channel_count
         .saturating_mul(max_concurrent_per_channel)
         .clamp(lo, hi)
@@ -22036,8 +22036,9 @@ temperature = 0.3
 
     #[test]
     fn compute_max_in_flight_messages_normalizes_invalid_min_max() {
-        // min > max must not panic: normalize the bounds instead.
-        assert_eq!(compute_max_in_flight_messages(2, 4, 5, 4), 5);
+        // min > max must not panic: the configured hard cap (max) wins and
+        // the floor collapses to it, so an operator-set ceiling is honored.
+        assert_eq!(compute_max_in_flight_messages(2, 4, 5, 4), 4);
         // Zero-permit input must not deadlock every worker: floor at 1.
         assert_eq!(compute_max_in_flight_messages(1, 1, 0, 0), 1);
     }
