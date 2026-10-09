@@ -2588,6 +2588,20 @@ fn contains_glob_metacharacters(s: &str) -> bool {
     s.chars().any(|c| matches!(c, '*' | '?' | '[' | ']'))
 }
 
+/// Normalize a path for glob matching. Canonical Windows paths use `\`, so on
+/// Windows it is rewritten to the `/` the patterns use. On Unix a backslash is
+/// an ordinary filename character: rewriting it into a separator would let a
+/// pattern such as `/workspace/scripts/*.sh` match an out-of-directory file
+/// spelled `/workspace/scripts\evil.sh`.
+fn glob_match_path(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    if cfg!(windows) {
+        s.replace('\\', "/")
+    } else {
+        s.into_owned()
+    }
+}
+
 fn is_allowlist_entry_match(
     allowed: &str,
     executable: &str,
@@ -2616,10 +2630,10 @@ fn is_allowlist_entry_match(
         }
 
         // Glob match (e.g. `/workspace/scripts/**/*.sh`). `*`/`?` never cross
-        // `/`; `**` crosses directories. Separators are normalized so
-        // `/`-oriented patterns match Windows canonical paths too.
-        let allowed_str = allowed_path.to_string_lossy().replace('\\', "/");
-        let executable_str = executable_path.to_string_lossy().replace('\\', "/");
+        // `/`; `**` crosses directories. Separators are normalized only on
+        // Windows so `/`-oriented patterns match canonical Windows paths.
+        let allowed_str = glob_match_path(&allowed_path);
+        let executable_str = glob_match_path(&executable_path);
         if contains_glob_metacharacters(&allowed_str)
             && let Ok(pattern) = glob::Pattern::new(&allowed_str)
             && pattern.matches_with(
@@ -5573,6 +5587,21 @@ mod tests {
             ..SecurityPolicy::default()
         };
         assert!(!p.is_command_allowed("git status"));
+    }
+
+    #[test]
+    fn glob_allowlist_does_not_rewrite_unix_backslash_into_separator() {
+        // On Unix a backslash is an ordinary filename character, not a
+        // separator. `scripts\evil.sh` is a single filename directly under
+        // `/workspace`, so the pattern `/workspace/scripts/*.sh` must not
+        // match it. (The separator normalization is Windows-only.)
+        if cfg!(not(windows)) {
+            let p = SecurityPolicy {
+                allowed_commands: vec!["/workspace/scripts/*.sh".into()],
+                ..SecurityPolicy::default()
+            };
+            assert!(!p.is_command_allowed("/workspace/scripts\\evil.sh"));
+        }
     }
 
     #[test]
