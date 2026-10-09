@@ -5036,6 +5036,22 @@ mod tests {
             self
         }
 
+        /// Build a provider whose single plain-text response reports the
+        /// given token usage, so cost recording runs through the production
+        /// recorder path in `parse_response`.
+        fn from_text_with_usage(text: &str, usage: zeroclaw_providers::traits::TokenUsage) -> Self {
+            let scripted = vec![ChatResponse {
+                text: Some(text.to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(usage),
+                reasoning_content: None,
+            }];
+            Self {
+                responses: Arc::new(Mutex::new(scripted.into())),
+                capabilities: ProviderCapabilities::default(),
+            }
+        }
+
         /// Build a native-tool-calling provider: one turn of structured
         /// `tool_calls`, then a plain-text turn.
         fn from_native_tool_calls(calls: Vec<(&str, &str, &str)>, final_text: &str) -> Self {
@@ -22066,6 +22082,139 @@ Let me check the result."#;
         // the full (channel, agent_alias, turn_id) triple — the same
         // expectation every other bracketed entry point is held to.
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("daemon"));
+    }
+
+    /// `agent_turn` must forward the turn's cost into `AgentEnd` only when
+    /// pricing is complete: known pricing emits the total, fully priced free
+    /// usage emits `Some(0.0)`, and missing or partial pricing emits `None`.
+    /// Drives one real turn through the production recorder (`parse_response`
+    /// → `record_tool_loop_cost_usage`) and the real `AgentTurnGuard`.
+    #[tokio::test]
+    async fn agent_turn_forwards_complete_cost_to_agent_end() {
+        use crate::agent::cost::ModelProviderPricing;
+        use crate::cost::CostTracker;
+        use std::collections::HashMap;
+
+        type Case = (
+            &'static str,
+            &'static str,
+            Vec<(&'static str, f64)>,
+            Option<f64>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "known",
+                "known-model",
+                vec![
+                    ("known-model.input", 2.0),
+                    ("known-model.cached_input", 0.0),
+                    ("known-model.output", 5.0),
+                ],
+                Some((100.0 * 2.0 + 20.0 * 5.0) / 1_000_000.0),
+            ),
+            (
+                "free",
+                "free-model",
+                vec![
+                    ("free-model.input", 0.0),
+                    ("free-model.cached_input", 0.0),
+                    ("free-model.output", 0.0),
+                ],
+                Some(0.0),
+            ),
+            ("missing", "missing-model", vec![], None),
+            (
+                "partial",
+                "partial-model",
+                vec![("partial-model.input", 2.0)],
+                None,
+            ),
+        ];
+
+        for (provider_name, model, rates, expected_cost) in cases {
+            let workspace = tempfile::TempDir::new().unwrap();
+            let cost_config = zeroclaw_config::schema::CostConfig {
+                enabled: true,
+                ..zeroclaw_config::schema::CostConfig::default()
+            };
+            let tracker = Arc::new(CostTracker::new(cost_config, workspace.path()).unwrap());
+            let model_pricing: HashMap<String, f64> = rates
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect();
+            let pricing: ModelProviderPricing =
+                HashMap::from([(provider_name.to_string(), model_pricing)]);
+            let ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(pricing));
+
+            let usage = zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                cached_input_tokens: Some(0),
+                cache_creation_input_tokens: None,
+            };
+            let model_provider = ScriptedModelProvider::from_text_with_usage("done", usage);
+            let tools_registry =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+            let capturing = Arc::new(CapturingObserver::default());
+            let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+            let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(
+                    Some(ctx),
+                    agent_turn(
+                        None,
+                        &model_provider,
+                        &mut history,
+                        &mut false,
+                        &mut None,
+                        &tools_registry,
+                        capturing.as_ref(),
+                        provider_name,
+                        model,
+                        Some(0.0),
+                        true,
+                        "daemon",
+                        None,
+                        &zeroclaw_config::schema::MultimodalConfig::default(),
+                        4,
+                        None,
+                        None,
+                        &[],
+                        &[],
+                        None,
+                        None,
+                        false,
+                        false,
+                        0,
+                        0,
+                        None,
+                        TurnOrigin::SubTurn,
+                        None,
+                        Some("test-agent"),
+                        None,
+                    ),
+                )
+                .await
+                .expect("agent_turn should complete");
+
+            assert_eq!(result, "done");
+
+            let events = capturing.events.lock();
+            let cost = events.iter().find_map(|event| match event {
+                ObserverEvent::AgentEnd { cost_usd, .. } => *cost_usd,
+                _ => None,
+            });
+            match (cost, expected_cost) {
+                (Some(actual), Some(expected)) => assert!(
+                    (actual - expected).abs() < 1e-12,
+                    "{provider_name}/{model}: {actual} != {expected}"
+                ),
+                (None, None) => {}
+                (actual, expected) => {
+                    panic!("{provider_name}/{model}: got {actual:?}, expected {expected:?}")
+                }
+            }
+        }
     }
 
     /// When the caller pre-mints a turn id (`process_message` does, so its
