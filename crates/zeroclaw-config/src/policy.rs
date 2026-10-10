@@ -4186,6 +4186,20 @@ impl SecurityPolicy {
         false
     }
 
+    /// Normalize a path for glob matching. Canonical Windows paths use `\`,
+    /// so on Windows it is rewritten to the `/` the patterns use. On Unix a
+    /// backslash is an ordinary filename character and must be preserved so a
+    /// pattern cannot match a file outside its intended directory (e.g.
+    /// `references\private.md` must not satisfy `**/references/*.md`).
+    fn glob_match_path(path: &Path) -> String {
+        let s = path.to_string_lossy();
+        if cfg!(windows) {
+            s.replace('\\', "/")
+        } else {
+            s.into_owned()
+        }
+    }
+
     /// Second-stage glob check for `file_read`: after the directory-level
     /// [`Self::is_resolved_path_readable`] passes, verify the canonicalized
     /// path matches at least one pattern in `file_read_allowed_patterns`.
@@ -4202,9 +4216,7 @@ impl SecurityPolicy {
         if self.file_read_allowed_patterns.is_empty() {
             return true;
         }
-        // Normalize Windows separators (`\`) to the `/` the patterns use, so
-        // a `**/SKILL.md` pattern matches on both platforms.
-        let path_str = resolved.to_string_lossy().replace('\\', "/");
+        let path_str = Self::glob_match_path(resolved);
         let options = glob::MatchOptions {
             case_sensitive: true,
             require_literal_separator: true,
@@ -10429,6 +10441,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn is_file_read_pattern_allowed_normalizes_windows_separators() {
         let p = pattern_policy(vec!["**/SKILL.md".into()]);
         assert!(
@@ -10439,5 +10452,16 @@ mod tests {
                 r"C:\Users\u\.zeroclaw\skills\foo\notes.txt"
             ))
         );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn is_file_read_pattern_allowed_preserves_unix_backslash_filename() {
+        // On Unix `references\private.md` is a single filename directly under
+        // the workspace root, not a file inside `references/`. It must not
+        // satisfy `**/references/*.md`.
+        let p = pattern_policy(vec!["**/references/*.md".into()]);
+        assert!(!p.is_file_read_pattern_allowed(Path::new(r"/workspace/references\private.md")));
+        assert!(p.is_file_read_pattern_allowed(Path::new("/workspace/references/private.md")));
     }
 }

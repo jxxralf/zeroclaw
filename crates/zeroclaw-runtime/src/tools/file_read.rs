@@ -154,8 +154,9 @@ impl FileReadTool {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!(
-                    "Path not allowed by file_read allowed patterns: {path}"
+                error: Some(crate::i18n::get_required_cli_string_with_args(
+                    "tool-file-read-error-pattern-not-allowed",
+                    &[("path", path)],
                 )),
             });
         }
