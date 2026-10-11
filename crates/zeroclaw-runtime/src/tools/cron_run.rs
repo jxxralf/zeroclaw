@@ -210,7 +210,7 @@ impl Tool for CronRunTool {
                         "job_id": job.id,
                         "agent_alias": job.agent_alias,
                         "error_key": "cron.shell.command_blocked",
-                        "diagnostic": zeroclaw_providers::sanitize_api_error(&reason.to_string()),
+                        "diagnostic": crate::security::scrub(&zeroclaw_providers::sanitize_api_error(&reason.to_string())),
                     })),
                 "Cron shell command blocked by security policy"
             );

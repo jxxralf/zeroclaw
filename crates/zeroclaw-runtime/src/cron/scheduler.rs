@@ -827,7 +827,7 @@ fn render_job_output(job: &CronJob, success: bool, output: String) -> String {
                 "job_id": job.id,
                 "agent_alias": job.agent_alias,
                 "error_key": "cron.shell.command_failed",
-                "diagnostic": zeroclaw_providers::sanitize_api_error(&output),
+                "diagnostic": crate::security::scrub(&zeroclaw_providers::sanitize_api_error(&output)),
             })),
         "Cron shell command failed"
     );
@@ -1627,7 +1627,7 @@ async fn run_job_command_with_runtime_and_timeout(
                                 "job_id": job.id,
                                 "agent_alias": job.agent_alias,
                                 "error_key": "cron.shell.command_warning",
-                                "diagnostic": zeroclaw_providers::sanitize_api_error(stderr),
+                                "diagnostic": crate::security::scrub(&zeroclaw_providers::sanitize_api_error(stderr)),
                             })),
                         "Cron shell command completed with stderr output"
                     );
@@ -2276,6 +2276,63 @@ mod tests {
         assert_eq!(output, "public-output");
         assert!(!output.contains("status="));
         assert!(!output.contains("stderr:"));
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn shell_success_logs_credential_scrubbed_stderr() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        let risk_profile = config.risk_profiles.entry(TEST_AGENT.into()).or_default();
+        risk_profile.level = crate::security::AutonomyLevel::Full;
+        risk_profile.allowed_commands = vec!["sh".into()];
+        tokio::fs::write(
+            config.data_dir.join("credential.sh"),
+            "printf 'public-output'\nprintf 'password=opaque-example-1234' >&2\n",
+        )
+        .await
+        .unwrap();
+        let job = test_job("sh credential.sh");
+        let security = test_security(&config);
+
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut logs = zeroclaw_log::subscribe_or_install();
+        while logs.try_recv().is_ok() {}
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(success);
+        assert_eq!(output, "public-output");
+        assert!(!output.contains("opaque-example-1234"));
+
+        // The stderr warning must be logged with the credential scrubbed.
+        let warning = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match logs.recv().await {
+                    Ok(event)
+                        if event
+                            .pointer("/attributes/error_key")
+                            .and_then(|v| v.as_str())
+                            == Some("cron.shell.command_warning") =>
+                    {
+                        break event;
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("log stream closed before command warning was recorded");
+                    }
+                }
+            }
+        })
+        .await
+        .expect("command warning should be recorded");
+        let diagnostic = warning
+            .pointer("/attributes/diagnostic")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            !diagnostic.contains("opaque-example-1234"),
+            "credential must be scrubbed from the logged diagnostic: {diagnostic}"
+        );
     }
 
     #[tokio::test]
