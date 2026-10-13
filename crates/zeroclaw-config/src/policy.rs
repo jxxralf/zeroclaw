@@ -4186,18 +4186,21 @@ impl SecurityPolicy {
         false
     }
 
-    /// Normalize a path for glob matching. Canonical Windows paths use `\`,
-    /// so on Windows it is rewritten to the `/` the patterns use. On Unix a
-    /// backslash is an ordinary filename character and must be preserved so a
-    /// pattern cannot match a file outside its intended directory (e.g.
-    /// `references\private.md` must not satisfy `**/references/*.md`).
-    fn glob_match_path(path: &Path) -> String {
-        let s = path.to_string_lossy();
-        if cfg!(windows) {
+    /// Normalize a path for glob matching. Returns `None` for a non-UTF-8
+    /// pathname, which the caller rejects (fail closed) because the UTF-8
+    /// glob patterns cannot match it without a lossy conversion collapsing
+    /// distinct filenames. Canonical Windows paths use `\`, so on Windows the
+    /// result is rewritten to the `/` the patterns use; on Unix a backslash is
+    /// an ordinary filename character and is preserved so a pattern cannot
+    /// match a file outside its intended directory (e.g. `references\private.md`
+    /// must not satisfy `**/references/*.md`).
+    fn glob_match_path(path: &Path) -> Option<String> {
+        let s = path.to_str()?;
+        Some(if cfg!(windows) {
             s.replace('\\', "/")
         } else {
-            s.into_owned()
-        }
+            s.to_string()
+        })
     }
 
     /// Second-stage glob check for `file_read`: after the directory-level
@@ -4216,7 +4219,11 @@ impl SecurityPolicy {
         if self.file_read_allowed_patterns.is_empty() {
             return true;
         }
-        let path_str = Self::glob_match_path(resolved);
+        let Some(path_str) = Self::glob_match_path(resolved) else {
+            // A non-UTF-8 pathname cannot match UTF-8 glob patterns; fail
+            // closed rather than matching through a lossy conversion.
+            return false;
+        };
         let options = glob::MatchOptions {
             case_sensitive: true,
             require_literal_separator: true,
@@ -10463,5 +10470,20 @@ mod tests {
         let p = pattern_policy(vec!["**/references/*.md".into()]);
         assert!(!p.is_file_read_pattern_allowed(Path::new(r"/workspace/references\private.md")));
         assert!(p.is_file_read_pattern_allowed(Path::new("/workspace/references/private.md")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn is_file_read_pattern_allowed_rejects_non_utf8_paths() {
+        // A non-UTF-8 pathname cannot match UTF-8 glob patterns; fail closed
+        // instead of matching through a lossy conversion that collapses
+        // distinct filenames.
+        use std::os::unix::ffi::OsStrExt;
+        let p = pattern_policy(vec!["**/SKILL.md".into()]);
+        let non_utf8 = std::ffi::OsStr::from_bytes(b"/workspace/\xFF\xFE.md");
+        assert!(!p.is_file_read_pattern_allowed(Path::new(non_utf8)));
+        // With no patterns configured, filtering is disabled and the path is
+        // still admitted by the directory-level gate.
+        assert!(pattern_policy(Vec::new()).is_file_read_pattern_allowed(Path::new(non_utf8)));
     }
 }
