@@ -827,7 +827,7 @@ fn render_job_output(job: &CronJob, success: bool, output: String) -> String {
                 "job_id": job.id,
                 "agent_alias": job.agent_alias,
                 "error_key": "cron.shell.command_failed",
-                "diagnostic": crate::security::scrub(&zeroclaw_providers::sanitize_api_error(&output)),
+                "diagnostic": zeroclaw_providers::sanitize_api_error(&crate::security::scrub(&output)),
             })),
         "Cron shell command failed"
     );
@@ -1627,7 +1627,7 @@ async fn run_job_command_with_runtime_and_timeout(
                                 "job_id": job.id,
                                 "agent_alias": job.agent_alias,
                                 "error_key": "cron.shell.command_warning",
-                                "diagnostic": crate::security::scrub(&zeroclaw_providers::sanitize_api_error(stderr)),
+                                "diagnostic": zeroclaw_providers::sanitize_api_error(&crate::security::scrub(stderr)),
                             })),
                         "Cron shell command completed with stderr output"
                     );
@@ -2286,53 +2286,88 @@ mod tests {
         let risk_profile = config.risk_profiles.entry(TEST_AGENT.into()).or_default();
         risk_profile.level = crate::security::AutonomyLevel::Full;
         risk_profile.allowed_commands = vec!["sh".into()];
-        tokio::fs::write(
-            config.data_dir.join("credential.sh"),
-            "printf 'public-output'\nprintf 'password=opaque-example-1234' >&2\n",
-        )
-        .await
-        .unwrap();
-        let job = test_job("sh credential.sh");
         let security = test_security(&config);
 
+        // A short credential and a secret that straddles the sanitizer's
+        // 500-byte truncation bound. Redaction must run before truncation or
+        // the straddling secret escapes as a truncated remnant.
+        let long_prefix = "x".repeat(480);
+        let straddle_secret = "0123456789abcdef0123456789abcdef";
+        let cases: Vec<(String, String)> = vec![
+            (
+                "password=opaque-example-1234".to_string(),
+                "opaque-example-1234".to_string(),
+            ),
+            (
+                format!("{long_prefix} secret={straddle_secret}"),
+                straddle_secret.to_string(),
+            ),
+        ];
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
         zeroclaw_log::try_install_capture_subscriber();
         let mut logs = zeroclaw_log::subscribe_or_install();
         while logs.try_recv().is_ok() {}
 
-        let (success, output) = run_job_command(&config, &security, &job).await;
-        assert!(success);
-        assert_eq!(output, "public-output");
-        assert!(!output.contains("opaque-example-1234"));
+        for (idx, (stderr_value, secret)) in cases.into_iter().enumerate() {
+            let job_id = unique_component("credential-job");
+            let script = format!("credential-{idx}.sh");
+            tokio::fs::write(
+                config.data_dir.join(&script),
+                format!("printf 'public-output'\nprintf '{stderr_value}' >&2\n"),
+            )
+            .await
+            .unwrap();
+            // Raw output format: the successful stderr was previously
+            // discarded entirely; this path must never retain it now.
+            let job = CronJob {
+                id: job_id.clone(),
+                command: format!("sh {script}"),
+                shell_output_format: CronShellOutputFormat::Raw,
+                ..test_job("")
+            };
 
-        // The stderr warning must be logged with the credential scrubbed.
-        let warning = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                match logs.recv().await {
-                    Ok(event)
-                        if event
-                            .pointer("/attributes/error_key")
-                            .and_then(|v| v.as_str())
-                            == Some("cron.shell.command_warning") =>
-                    {
-                        break event;
-                    }
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        panic!("log stream closed before command warning was recorded");
+            let (success, output) = run_job_command(&config, &security, &job).await;
+            assert!(success);
+            assert_eq!(output, "public-output");
+            assert!(!output.contains(secret.as_str()));
+
+            // The stderr warning must be logged for THIS job with the
+            // credential scrubbed from the diagnostic.
+            let warning = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    match logs.recv().await {
+                        Ok(event)
+                            if event
+                                .pointer("/attributes/error_key")
+                                .and_then(|v| v.as_str())
+                                == Some("cron.shell.command_warning")
+                                && event.pointer("/attributes/job_id").and_then(|v| v.as_str())
+                                    == Some(job_id.as_str()) =>
+                        {
+                            break event;
+                        }
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            panic!("log stream closed before command warning was recorded");
+                        }
                     }
                 }
-            }
-        })
-        .await
-        .expect("command warning should be recorded");
-        let diagnostic = warning
-            .pointer("/attributes/diagnostic")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        assert!(
-            !diagnostic.contains("opaque-example-1234"),
-            "credential must be scrubbed from the logged diagnostic: {diagnostic}"
-        );
+            })
+            .await
+            .expect("command warning should be recorded");
+            let diagnostic = warning
+                .pointer("/attributes/diagnostic")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| {
+                    panic!("command warning must carry a diagnostic attribute for job {job_id}")
+                });
+            assert!(
+                !diagnostic.contains(secret.as_str()),
+                "credential must be scrubbed from the logged diagnostic: {diagnostic}"
+            );
+        }
     }
 
     #[tokio::test]
