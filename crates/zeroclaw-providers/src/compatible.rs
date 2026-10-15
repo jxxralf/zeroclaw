@@ -5083,7 +5083,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 .iter()
                 .map(|m| Message {
                     role: m.role.clone(),
-                    content: provider.message_content_for_role(&m.role, &m.content, provider.supports_vision),
+                    content: provider.message_content_for_role(
+                        &m.role,
+                        &m.content,
+                        provider.supports_vision,
+                    ),
                     thinking_blocks: None,
                 })
                 .collect();
