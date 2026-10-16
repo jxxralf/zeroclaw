@@ -3077,6 +3077,43 @@ mod tests {
         );
         assert!(user_content.as_str().unwrap().contains("[IMAGE:"));
 
+        // vision = Some(true) + merge_system_into_user = true: the system
+        // prompt is folded into the first user message, and the user's image
+        // marker must still be converted (the pre-fix `!merge` gate lost it).
+        let merged_options = ModelProviderRuntimeOptions {
+            vision: Some(true),
+            merge_system_into_user: true,
+            ..Default::default()
+        };
+        let provider = create_model_provider_with_options(
+            &format!("llamacpp:http://{addr}"),
+            Some("test-key"),
+            &merged_options,
+        )
+        .unwrap();
+        let merged_messages = vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user(format!("look at this {image}")),
+        ];
+        provider
+            .chat(
+                ChatRequest {
+                    messages: &merged_messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap();
+        let body = captured.lock().unwrap().pop().unwrap();
+        let user_content = &body["messages"][0]["content"];
+        assert!(
+            user_content.is_array(),
+            "vision=true with system merge should emit image parts, got: {user_content}"
+        );
+
         server.abort();
     }
 
