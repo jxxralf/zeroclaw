@@ -796,9 +796,10 @@ async fn execute_job_now_with_runtime(
         approved,
         execution_admission,
     ))
-    .instrument(span)
+    .instrument(span.clone())
     .await;
-    (success, render_job_output(job, success, output))
+    let rendered = span.in_scope(|| render_job_output(job, success, output));
+    (success, rendered)
 }
 
 /// Render a job's result for the channel. Shell jobs never expose raw
@@ -1081,9 +1082,9 @@ async fn execute_and_persist_job(
         false,
         execution_admission.clone(),
     ))
-    .instrument(span)
+    .instrument(span.clone())
     .await;
-    let output = render_job_output(job, success, output);
+    let output = span.in_scope(|| render_job_output(job, success, output));
     let finished_at = Utc::now();
     let success = Box::pin(persist_job_result(
         &effective_config,
@@ -2376,9 +2377,19 @@ mod tests {
                 .unwrap_or_else(|| {
                     panic!("command warning must carry a diagnostic attribute for job {job_id}")
                 });
+            // The redaction marker must be present, and no leading slice of
+            // the secret may survive. The old truncate-then-scrub order left
+            // a 12-character prefix (`0123456789ab`) behind, which a
+            // full-secret-only check would not catch, so reject the first 12
+            // characters explicitly.
+            let probe_len = secret.len().min(12);
             assert!(
-                !diagnostic.contains(secret.as_str()),
-                "credential must be scrubbed from the logged diagnostic: {diagnostic}"
+                diagnostic.contains("[REDACTED"),
+                "credential must be redacted in the logged diagnostic: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(&secret[..probe_len]),
+                "no leading slice of the credential may survive truncation: {diagnostic}"
             );
         }
     }
