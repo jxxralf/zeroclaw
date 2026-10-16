@@ -3576,6 +3576,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn factory_renames_reasoning_content_to_configured_key() {
+        use axum::extract::State;
+        use axum::{Json, Router, routing::post};
+        use std::sync::{Arc, Mutex};
+
+        async fn capture(
+            State(captured): State<Arc<Mutex<Vec<serde_json::Value>>>>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            captured.lock().unwrap().push(body);
+            Json(serde_json::json!({"choices": [{"message": {"content": "ok"}}]}))
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/chat/completions", post(capture))
+            .with_state(Arc::clone(&captured));
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // The assistant's replayed reasoning travels as `reasoning_content`
+        // in the request; `reasoning_key` must rename it on the wire.
+        let history = serde_json::json!({
+            "role": "assistant",
+            "content": "answer",
+            "reasoning_content": "thinking"
+        });
+        let messages = vec![
+            ChatMessage::assistant(history.to_string()),
+            ChatMessage::user("continue"),
+        ];
+
+        let options = ModelProviderRuntimeOptions {
+            reasoning_key: Some("reasoning".to_string()),
+            ..Default::default()
+        };
+        let provider = create_model_provider_with_options(
+            &format!("custom:http://{addr}"),
+            Some("test-key"),
+            &options,
+        )
+        .unwrap();
+        provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let body = captured.lock().unwrap().pop().unwrap();
+        let first = &body["messages"][0];
+        assert!(
+            first.get("reasoning").is_some(),
+            "reasoning_key must rename reasoning_content on the wire: {body}"
+        );
+        assert!(
+            first.get("reasoning_content").is_none(),
+            "canonical reasoning_content must be renamed away: {body}"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn reasoning_effort_passthrough_config_to_wire_isolates_bare_family_refs() {
         use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
         use serde_json::{Value, json};
