@@ -133,6 +133,92 @@ because verifying compiles and instantiates every component. A skill bundle
 ships no component, so it is reported as not applicable rather than as a
 failure.
 
+### Recovering an incomplete installation
+
+`zeroclaw plugin install` builds a package in a unique hidden transaction
+inside the plugins directory and holds an operating-system lease through
+publication. It moves the package into place without replacing any occupant,
+only after the manifest, component, and any `skills/` tree are written. If the
+platform or filesystem cannot provide an atomic no-replace move, as on FreeBSD
+and the other Unix systems besides Linux, Android and macOS, on an NFS mount
+without no-replace support, or on Linux before 3.15, installation refuses,
+removes its staged copy and says so; retrying there fails the same way. A failed
+or interrupted write leaves no partial package under the final name. Discovery
+ignores hidden transactions, and a later install uses
+fresh staging instead of replacing another process's stage.
+
+An unsupported move is not a reason to retry on the same unsupported
+filesystem. If cleanup also fails, install reports the failed cleanup location
+and requires that failure and safe-move support to be resolved first. The
+location is the package directory for a partial clear or failed empty-directory
+unlink, or the transaction entry if its package is absent or was already removed.
+The message does not claim the original payload is still intact. Cleanup checks
+treat a replaced or removed plugins root or coordination lock as a namespace
+refusal before continuing. The reported hidden transaction belongs to this failed
+install and does not block a later one: `plugin remove` does not sweep it while no
+package of that name exists, so once no install is running you may inspect and
+delete that specific transaction by hand.
+
+Earlier builds wrote straight into the final directory, creating it and then
+writing `manifest.toml` first, so an interrupted install could leave an empty
+directory, a truncated manifest, or a manifest without its component.
+Discovery skips such a directory, so it is not an installed package, yet it
+still holds the name. `zeroclaw plugin install` never overwrites anything
+already at a package name: it refuses and names
+`zeroclaw plugin remove <name>` as the recovery.
+
+For a name the host has not loaded, `plugin remove` claims the selected
+directory generation in a hidden recovery transaction and applies the same
+admission checks to those held contents. It deletes that generation in two
+cases only:
+
+- The directory is empty.
+- It holds a `manifest.toml` and fails the admission checks install and
+  discovery apply, because of its own contents: a truncated or unparsable
+  manifest, a missing component, a component that does not match its declared
+  `wasm_sha256`, or a package this host cannot accept as written, such as a
+  component over the admission size limit, a `config_schema` it cannot
+  compile, or an incomplete skill bundle. It must also hold nothing an install
+  never writes. An install writes a package under its manifest's name: the
+  manifest first, and after it only the component at its `wasm_path`, as a
+  file with the folders on the way, and, for a skill plugin, a `skills/`
+  folder of files and subfolders. So next to a manifest that does not parse
+  there may be nothing else, and next to one that parses only those entries,
+  under the name that manifest gives.
+
+Recovery also cleans provably abandoned stages created by the lease protocol.
+Active stages and ambiguous legacy `.<name>.installing-<pid>` directories are
+retained, and the command reports their paths. A PID in a filename does not
+prove abandonment. These retained stages do not prevent a fresh install after
+the incomplete final package is recovered. If no final package exists,
+`plugin remove` does not sweep staging directories, unless it finishes a
+delete that an earlier `plugin remove` had begun.
+
+Other occupants are refused, and the command prints why: a symlink or a
+file at the name, a directory that holds files but no `manifest.toml`, one
+that holds files an install never writes, such as a plugin's source checkout
+whose component is not built yet or a `.DS_Store` a file manager added, one
+whose manifest names another package, a directory it cannot inspect or list,
+the directory a loaded package was loaded from, a package admission accepts,
+and a package this host rejects for its signature policy (unsigned, from an
+untrusted publisher, carrying an invalid signature, or without a signed
+`wasm_sha256` in `strict` mode). Admission checks the signature before it reads the component,
+so under `strict` a stranded manifest from an unsigned package, or one cut so
+that its signature no longer verifies, is refused for its signature even
+though its component is missing.
+
+A refused claimed package is restored without replacing any concurrent
+occupant, including an empty directory. Recovery refuses a claim or restoration
+when the platform or filesystem cannot provide an atomic no-replace move.
+If restoration cannot finish, its bytes remain at the reported
+hidden location; the original name is not necessarily untouched. Retrying
+`plugin remove` restores a retained recovery transaction before checking
+admission again. A delete that `plugin remove` had begun is finished instead:
+once it starts deleting a package it judged incomplete, a retry completes that
+delete. Resolve the reported destination conflict or filesystem
+error before retrying; do not delete hidden transactions merely because they
+look like leftovers.
+
 ## Execution model
 
 The host (`crates/zeroclaw-plugins/src/component.rs`) owns one async
@@ -648,6 +734,57 @@ not stop the package's other instances from being reported. `plugin list`,
 `plugin info`, `plugin install`, and `plugin remove` print one line saying the
 binding is skipped, with the alias escaped, and name the
 `[channels.plugin.<alias>]` table to rename or remove.
+
+## Installing from Quickstart
+
+A build with the plugin host can also install tool plugins from the optional
+Plugins row of the CLI Quickstart;
+[Quickstart → Plugins](../getting-started/quickstart.md#plugins) walks through
+it. Quickstart runs the same download, admission, load check, and
+publish-and-seed transaction as `zeroclaw plugin install`, and the rules above
+still apply:
+
+- **Declaration versus grant.** Quickstart shows you the manifest's `[egress]`
+  declaration, which grants nothing by itself. Whenever it creates a row for a
+  package whose manifest requests `http_client` and declares destinations, the
+  only declaration a created row is seeded with, you choose whether the new
+  row grants them, whether the package is new or was already installed
+  without its row. The question starts on installing without network access,
+  which leaves `egress_hosts` empty and prints the command that grants the
+  destinations later, as `plugin bind --egress none` does for a channel
+  instance. Skipping an already installed package leaves its row absent and
+  prints the command that creates it with an empty grant, then, on its own
+  line, the command that grants the declared destinations. The command
+  Quickstart prints to create a missing row never grants network access; a
+  grant is always a command of its own. The `plugin install --no-verify`
+  command Quickstart prints for a plugin that fails the load check is the
+  plugin CLI's install, which, as always, seeds a row it creates with the
+  destinations the manifest declares for `http_client`.
+- **An existing row is never extended.** When the instance's
+  `[[plugins.entries]]` row already exists, Quickstart leaves its
+  `egress_hosts`, `egress_allow_private`, and settings exactly as they are. It
+  never downloads, upgrades, or reconfigures a package that is already
+  installed, and only creates that package's row if it is missing.
+- **Activation needs your consent.** Quickstart never turns on
+  `plugins.enabled` or `plugins.auto_discover` without asking. Before it asks,
+  it lists every tool, skill, and channel plugin those settings would
+  activate, including plugins installed earlier, and the question defaults to
+  no when that list goes beyond the plugins the run installed or kept. A
+  plugin whose missing row you skipped, or that Quickstart could not finish
+  setting up, is not one of them. The list comes
+  from the plugins directory as a daemon would load it; when that directory
+  cannot be read, the question also defaults to no.
+
+Quickstart is stricter than `plugin install` in three respects. It refuses a
+registry entry that carries no `sha256` digest for its archive instead of
+installing an archive it cannot verify. While the `[plugins]` section of
+the config file cannot be read, it installs nothing, where `plugin install`
+installs the package and only warns that it did not seed the package's
+`[[plugins.entries]]` row. And whatever `plugins.security.signature_mode` is,
+its package summary says whether the manifest signature verifies against
+`plugins.security.trusted_publisher_keys`, and it installs a package whose
+signature does not verify only after you answer yes to a question that
+defaults to no; `signature_mode` still decides what admission refuses.
 
 ## Where the trust boundary actually is
 

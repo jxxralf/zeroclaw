@@ -8,7 +8,7 @@ use crate::autonomy::AutonomyLevel;
 use crate::autonomy::DelegationPolicy;
 use crate::domain_matcher::DomainMatcher;
 use crate::pairing::{PAIRING_CODE_MAX_LENGTH, PAIRING_CODE_MIN_LENGTH, PairingCodePolicy};
-use crate::traits::{ChannelConfig, HasPropKind, PropKind};
+use crate::traits::{ApplicationCapability, ChannelConfig, HasPropKind, PropKind};
 use crate::validation_bail;
 use anyhow::{Context, Result};
 use directories::UserDirs;
@@ -24,6 +24,43 @@ use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use zeroclaw_api::runtime_status::RuntimeConfigKind;
 use zeroclaw_macros::Configurable;
+
+/// One config snapshot's property application metadata, built once by
+/// [`Config::application_capabilities`] and queried per changed path.
+#[derive(Debug, Clone)]
+pub struct ApplicationCapabilities {
+    fields: Vec<(String, ApplicationCapability)>,
+}
+
+impl ApplicationCapabilities {
+    /// Resolve potential application for `path`, defaulting to reload.
+    pub fn capability(&self, path: &[String]) -> ApplicationCapability {
+        // Dotted metadata cannot distinguish an opaque dotted key from nesting.
+        if path.is_empty()
+            || path
+                .iter()
+                .any(|part| part.is_empty() || part.contains('.'))
+        {
+            return ApplicationCapability::ReloadRequired;
+        }
+        let name = path.join(".");
+        let subtree = format!("{name}.");
+        let mut matched = false;
+        for (field_name, application) in &self.fields {
+            if *field_name == name || field_name.starts_with(&subtree) {
+                matched = true;
+                if *application != ApplicationCapability::ModelProviderRefresh {
+                    return ApplicationCapability::ReloadRequired;
+                }
+            }
+        }
+        if matched {
+            ApplicationCapability::ModelProviderRefresh
+        } else {
+            ApplicationCapability::ReloadRequired
+        }
+    }
+}
 
 const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "model_provider.anthropic",
@@ -4176,6 +4213,7 @@ pub struct AliasedAgentConfig {
     /// `Config::validate()` fails loud on dangling references.
     #[tab(Providers)]
     #[serde(default)]
+    #[application = "model_provider_refresh"]
     pub model_provider: crate::providers::ModelProviderRef,
     /// Risk profile alias (e.g. `"default"`). Resolves delegation guardrails at runtime.
     #[tab(General)]
@@ -4626,6 +4664,13 @@ impl Config {
             .map(|p| p.max_tool_iterations)
             .filter(|&v| v > 0)
             .unwrap_or(10)
+    }
+
+    #[must_use]
+    pub fn effective_single_tool_rounds(&self, agent_alias: &str) -> bool {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|profile| profile.single_tool_rounds)
+            .unwrap_or(false)
     }
 
     #[must_use]
@@ -14735,6 +14780,8 @@ pub struct RuntimeProfileConfig {
     pub compact_context: Option<bool>,
     /// Enable parallel tool execution per iteration. `None` inherits.
     pub parallel_tools: Option<bool>,
+    /// Request one native tool call per provider response when supported. Default off.
+    pub single_tool_rounds: Option<bool>,
     /// Tool dispatch strategy (e.g. `"auto"`). `None` inherits.
     pub tool_dispatcher: Option<String>,
     /// Tools exempt from within-turn dedup check.
@@ -14794,6 +14841,7 @@ impl Default for RuntimeProfileConfig {
             context_compact_ratio: None,
             compact_context: None,
             parallel_tools: None,
+            single_tool_rounds: None,
             tool_dispatcher: None,
             tool_call_dedup_exempt: Vec::new(),
             deferred_builtin_tools: false,
@@ -15201,6 +15249,7 @@ impl Default for SchedulerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "model_routes"]
+#[application = "model_provider_refresh"]
 pub struct ModelRouteConfig {
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
     /// `#[serde(default)]` lets the `create_map_key` macro default-construct
@@ -21459,31 +21508,120 @@ fn paths_equal_lexically(a: &Path, b: &Path) -> bool {
 /// visible to the runtime, which now scans [`PluginsConfig::resolved_plugins_dir`].
 ///
 /// Historically `zeroclaw plugin install` wrote to `<data_dir>/plugins` (and,
-/// before the data-dir rename, `<install_root>/workspace/plugins`). A directory
-/// is reported only when it differs from the configured plugins dir and contains
-/// at least one plugin (a subdirectory with a `manifest.toml`). Used to surface a
-/// migration hint and to drive `zeroclaw plugin migrate`.
+/// before the data-dir rename, `<install_root>/workspace/plugins`). New V2
+/// splits route packages to host data. An older split's live agent workspace
+/// is not an automatic recovery source: compatible packages there require
+/// explicit operator adoption through `zeroclaw plugin install <path>`.
+/// Supported legacy root aliases are followed, but roots overlapping a known
+/// agent workspace in either direction are excluded. Target aliases are
+/// excluded and duplicate roots occur once. This selection does not bind the
+/// packages a later mover rescans or authenticate their historical origin.
+/// Used to surface a migration hint and to drive `zeroclaw plugin migrate`.
 #[must_use]
 pub fn legacy_plugin_dirs_with_entries(config: &Config) -> Vec<PathBuf> {
     let target = config.plugins.resolved_plugins_dir();
+    let canonical_target = std::fs::canonicalize(&target).ok();
+    let workspaces: Vec<PathBuf> = std::iter::once(config.agent_workspace_dir("default"))
+        .chain(
+            config
+                .agents
+                .keys()
+                .map(|alias| config.agent_workspace_dir(alias)),
+        )
+        .chain(std::iter::once(
+            config.install_root_dir().join("agents/default/workspace"),
+        ))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
     [
         config.data_dir.join("plugins"),
         config.install_root_dir().join("workspace").join("plugins"),
+        v2::workspace_toplevel_v3_path(&config.install_root_dir(), "plugins"),
     ]
     .into_iter()
-    .filter(|legacy| *legacy != target && dir_has_plugin(legacy))
+    .filter(|legacy| {
+        if paths_equal_lexically(legacy, &target) || !dir_has_plugin(legacy) {
+            return false;
+        }
+        let Ok(canonical) = std::fs::canonicalize(legacy) else {
+            return false;
+        };
+        if workspaces
+            .iter()
+            .any(|workspace| legacy_root_overlaps_workspace(legacy, &canonical, workspace))
+        {
+            return false;
+        }
+        canonical_target.as_ref() != Some(&canonical) && seen.insert(canonical)
+    })
     .collect()
 }
 
-/// Returns `true` if `dir` holds at least one plugin (a subdirectory containing a
-/// `manifest.toml`).
+fn legacy_root_overlaps_workspace(legacy: &Path, canonical: &Path, workspace: &Path) -> bool {
+    let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+    if let Ok(workspace) = std::fs::canonicalize(workspace) {
+        return overlaps(canonical, &workspace);
+    }
+    // An absent declared workspace is still a known role. Compare normalized
+    // lexical paths conservatively; do not create it or attest it as present.
+    let Some(lexical_workspace) = legacy_lexical_absolute_path(workspace) else {
+        return true;
+    };
+    let Some(legacy) = legacy_lexical_absolute_path(legacy) else {
+        return true;
+    };
+    if overlaps(&legacy, &lexical_workspace) || overlaps(canonical, &lexical_workspace) {
+        return true;
+    }
+    // A declared absent child may be reached through an existing parent alias.
+    // Resolve only that existing ancestor, then compare the remaining declared
+    // path lexically. This does not attest the missing workspace as present.
+    for ancestor in workspace.ancestors().skip(1) {
+        if let Ok(parent) = std::fs::canonicalize(ancestor) {
+            let Ok(suffix) = workspace.strip_prefix(ancestor) else {
+                return true;
+            };
+            let Some(projected) = legacy_lexical_absolute_path(&parent.join(suffix)) else {
+                return true;
+            };
+            return overlaps(canonical, &projected);
+        }
+    }
+    false
+}
+
+fn legacy_lexical_absolute_path(path: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    if !absolute.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    Some(normalized)
+}
+
+/// Returns `true` if `dir` holds at least one ordinary child directory containing
+/// a `manifest.toml`, matching the runtime's package-directory eligibility.
 fn dir_has_plugin(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
-    entries
-        .flatten()
-        .any(|entry| entry.path().join("manifest.toml").exists())
+    entries.flatten().any(|entry| {
+        entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && entry.path().join("manifest.toml").exists()
+    })
 }
 
 /// Detect if an executable path lives under a macOS Homebrew prefix and return
@@ -22212,6 +22350,79 @@ pub mod test_post_replace_pause_gate {
 }
 
 impl Config {
+    /// Compare unmasked semantic properties, independently of dirty-path bookkeeping.
+    /// Serialized values are temporary; only opaque path components are returned.
+    /// Serde-skipped loader diagnostics and process-local bookkeeping are excluded.
+    pub fn semantic_changed_paths(previous: &Self, candidate: &Self) -> Result<Vec<Vec<String>>> {
+        fn materialize(config: &Config) -> Result<toml::Value> {
+            let mut value =
+                toml::Value::try_from(config).context("cannot materialize config change scope")?;
+            let table = value
+                .as_table_mut()
+                .context("config change scope must be a table")?;
+            // Root serialization omits this entire section when disabled,
+            // even though its other fields still belong to the config.
+            table.insert(
+                "conversational_ai".to_string(),
+                toml::Value::try_from(&config.conversational_ai)
+                    .context("cannot materialize conversational AI change scope")?,
+            );
+            Ok(value)
+        }
+
+        fn compare(
+            previous: &toml::Value,
+            candidate: &toml::Value,
+            path: &mut Vec<String>,
+            changed: &mut Vec<Vec<String>>,
+        ) {
+            match (previous, candidate) {
+                (toml::Value::Table(before), toml::Value::Table(after)) => {
+                    let keys: std::collections::BTreeSet<_> =
+                        before.keys().chain(after.keys()).collect();
+                    for key in keys {
+                        path.push(key.clone());
+                        match (before.get(key), after.get(key)) {
+                            (Some(before), Some(after)) => compare(before, after, path, changed),
+                            _ => changed.push(path.clone()),
+                        }
+                        path.pop();
+                    }
+                }
+                // Arrays remain one semantic property, including natural-key lists.
+                _ if previous != candidate => changed.push(path.clone()),
+                _ => {}
+            }
+        }
+
+        let previous = materialize(previous)?;
+        let candidate = materialize(candidate)?;
+        let mut changed = Vec::new();
+        compare(&previous, &candidate, &mut Vec::new(), &mut changed);
+        Ok(changed)
+    }
+
+    /// Resolve potential application from generated metadata, defaulting to reload.
+    ///
+    /// Builds this snapshot's property metadata on every call. To classify
+    /// several paths against one snapshot, build
+    /// [`Config::application_capabilities`] once and query it per path.
+    pub fn application_capability(&self, path: &[String]) -> ApplicationCapability {
+        self.application_capabilities().capability(path)
+    }
+
+    /// Snapshot this config's per-property application metadata once, so
+    /// many paths can be classified without re-deriving `prop_fields()`.
+    pub fn application_capabilities(&self) -> ApplicationCapabilities {
+        ApplicationCapabilities {
+            fields: self
+                .prop_fields()
+                .into_iter()
+                .map(|field| (field.name, field.application))
+                .collect(),
+        }
+    }
+
     /// The resolved peer policy for `<channel_type>.<alias>`: every granted
     /// entry, plus every `ignore` entry as a `PEER_DENY_PREFIX` marker.
     ///
@@ -28117,6 +28328,263 @@ impl HasPropKind for serde_json::Value {
 #[cfg(test)]
 mod tests {
     #[::core::prelude::v1::test]
+    fn config_application_semantic_changed_paths_detects_unmasked_credentials() {
+        let mut previous = Config::default();
+        previous.providers.models.openai.insert(
+            "default".into(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("old-test-secret".into()),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        let mut candidate = previous.clone();
+        candidate
+            .providers
+            .models
+            .openai
+            .get_mut("default")
+            .unwrap()
+            .base
+            .api_key = Some("new-test-secret".into());
+
+        let name = "providers.models.openai.default.api_key";
+        assert_eq!(
+            previous.get_prop(name).unwrap(),
+            candidate.get_prop(name).unwrap()
+        );
+        let paths = Config::semantic_changed_paths(&previous, &candidate).unwrap();
+        assert_eq!(
+            paths,
+            vec![vec!["providers", "models", "openai", "default", "api_key"]]
+        );
+        assert_eq!(
+            candidate.application_capability(&paths[0]),
+            ApplicationCapability::ModelProviderRefresh
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_application_semantic_changed_paths_ignores_dirty_set_for_full_replacement() {
+        let previous = Config::default();
+        let mut candidate = previous.clone();
+        candidate.gateway.port += 1;
+        assert!(candidate.dirty_paths.is_empty());
+        let paths = Config::semantic_changed_paths(&previous, &candidate).unwrap();
+        assert_eq!(paths, vec![vec!["gateway", "port"]]);
+        candidate.mark_dirty("unrelated.path");
+        assert_eq!(
+            Config::semantic_changed_paths(&previous, &candidate).unwrap(),
+            paths
+        );
+        candidate.dirty_paths.clear();
+        candidate.gateway.port = previous.gateway.port;
+        assert!(
+            Config::semantic_changed_paths(&previous, &candidate)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_application_semantic_changed_paths_includes_disabled_conversational_ai() {
+        let previous = Config::default();
+        let mut candidate = previous.clone();
+        candidate.conversational_ai.default_language = "de".into();
+        assert!(!candidate.conversational_ai.enabled);
+        assert!(
+            toml::Value::try_from(&candidate)
+                .unwrap()
+                .get("conversational_ai")
+                .is_none()
+        );
+        assert_eq!(
+            Config::semantic_changed_paths(&previous, &candidate).unwrap(),
+            vec![vec!["conversational_ai", "default_language"]],
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_application_semantic_changed_paths_preserves_dotted_alias_and_table_presence() {
+        let mut previous = Config::default();
+        previous
+            .agents
+            .insert("ops.team".into(), AliasedAgentConfig::default());
+        let mut candidate = previous.clone();
+        candidate.agents.get_mut("ops.team").unwrap().model_provider = "openai.default".into();
+        let paths = Config::semantic_changed_paths(&previous, &candidate).unwrap();
+        assert_eq!(paths, vec![vec!["agents", "ops.team", "model_provider"]]);
+        assert_eq!(
+            candidate.application_capability(&paths[0]),
+            ApplicationCapability::ReloadRequired
+        );
+
+        candidate.agents.remove("ops.team");
+        assert_eq!(
+            Config::semantic_changed_paths(&previous, &candidate).unwrap(),
+            vec![vec!["agents", "ops.team"]],
+        );
+        assert_eq!(
+            Config::semantic_changed_paths(&candidate, &previous).unwrap(),
+            vec![vec!["agents", "ops.team"]],
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_application_semantic_changed_paths_treats_arrays_as_whole_properties() {
+        let mut previous = Config::default();
+        previous.model_routes.push(ModelRouteConfig {
+            hint: "fast".into(),
+            model: "old-model".into(),
+            ..ModelRouteConfig::default()
+        });
+        let mut candidate = previous.clone();
+        candidate.model_routes[0].model = "new-model".into();
+        candidate.gateway.paired_tokens.push("test-token".into());
+        assert_eq!(
+            Config::semantic_changed_paths(&previous, &candidate).unwrap(),
+            vec![vec!["gateway", "paired_tokens"], vec!["model_routes"]],
+        );
+        assert_eq!(
+            candidate.application_capability(&["model_routes".into()]),
+            ApplicationCapability::ModelProviderRefresh
+        );
+        assert_eq!(
+            candidate.application_capability(&["gateway".into(), "paired_tokens".into()]),
+            ApplicationCapability::ReloadRequired
+        );
+        candidate.model_routes.clear();
+        assert_eq!(
+            candidate.application_capability(&["model_routes".into()]),
+            ApplicationCapability::ReloadRequired
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[::core::prelude::v1::test]
+    fn config_application_semantic_changed_paths_propagates_materialization_failure() {
+        let previous = Config::default();
+        let mut candidate = previous.clone();
+        // Disabled-section extraction must propagate failure too.
+        candidate.conversational_ai.max_conversation_turns = usize::MAX;
+        assert!(Config::semantic_changed_paths(&previous, &candidate).is_err());
+        assert!(Config::semantic_changed_paths(&candidate, &previous).is_err());
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_application_metadata_defaults_and_annotated_scope() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .openai
+            .insert("prod_v2".into(), OpenAIModelProviderConfig::default());
+        config
+            .providers
+            .tts
+            .openai
+            .insert("default".into(), OpenAITtsProviderConfig::default());
+        config
+            .agents
+            .insert("ops_team".into(), AliasedAgentConfig::default());
+        config.model_routes.push(ModelRouteConfig {
+            hint: "fast".into(),
+            ..ModelRouteConfig::default()
+        });
+        let fields = config.prop_fields();
+        let capabilities = config.application_capabilities();
+        let live: Vec<_> = fields
+            .iter()
+            .filter(|field| field.application == ApplicationCapability::ModelProviderRefresh)
+            .collect();
+        assert!(!live.is_empty());
+        assert!(
+            live.iter()
+                .all(|field| field.name.starts_with("providers.models.")
+                    || field.name.starts_with("model_routes.")
+                    || field.name == "agents.ops_team.model_provider")
+        );
+        for prefix in ["providers.models.", "model_routes."] {
+            let children: Vec<_> = fields
+                .iter()
+                .filter(|field| field.name.starts_with(prefix))
+                .collect();
+            assert!(!children.is_empty());
+            assert!(
+                children
+                    .iter()
+                    .all(|field| field.application == ApplicationCapability::ModelProviderRefresh)
+            );
+        }
+        for path in [
+            vec!["providers", "models"],
+            vec!["providers", "models", "openai", "prod_v2"],
+            vec!["providers", "models", "openai", "prod_v2", "api_key"],
+            vec!["agents", "ops_team", "model_provider"],
+            vec!["model_routes"],
+        ] {
+            let path: Vec<_> = path.into_iter().map(str::to_string).collect();
+            assert_eq!(
+                config.application_capability(&path),
+                ApplicationCapability::ModelProviderRefresh
+            );
+            assert_eq!(
+                capabilities.capability(&path),
+                ApplicationCapability::ModelProviderRefresh,
+                "the reusable snapshot index must agree with the per-call lookup for {path:?}"
+            );
+        }
+        for path in [
+            vec![],
+            vec!["unknown"],
+            vec!["providers", "models", "unknown"],
+            vec!["providers", "models", "openai", "prod_v2", "unknown"],
+            vec!["providers"],
+            vec!["providers", "tts"],
+            vec!["gateway"],
+            vec!["agents", "ops_team"],
+            vec!["agents", "ops_team", "enabled"],
+            vec!["providers.models", "openai", "prod_v2", "api_key"],
+        ] {
+            let path: Vec<_> = path.into_iter().map(str::to_string).collect();
+            assert_eq!(
+                config.application_capability(&path),
+                ApplicationCapability::ReloadRequired
+            );
+            assert_eq!(
+                capabilities.capability(&path),
+                ApplicationCapability::ReloadRequired,
+                "the reusable snapshot index must agree with the per-call lookup for {path:?}"
+            );
+        }
+        assert_eq!(
+            ApplicationCapability::default(),
+            ApplicationCapability::ReloadRequired
+        );
+        for capability in [
+            ApplicationCapability::ReloadRequired,
+            ApplicationCapability::ModelProviderRefresh,
+        ] {
+            let wire = serde_json::to_value(capability).unwrap();
+            assert_eq!(
+                serde_json::from_value::<ApplicationCapability>(wire).unwrap(),
+                capability
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(ApplicationCapability::ModelProviderRefresh).unwrap(),
+            "model_provider_refresh"
+        );
+        #[cfg(feature = "schema-export")]
+        assert!(
+            !serde_json::to_value(schemars::schema_for!(ApplicationCapability))
+                .unwrap()
+                .is_null()
+        );
+    }
+
+    #[::core::prelude::v1::test]
     fn channel_external_peers_carries_every_ignore_across_matching_groups() {
         let config: super::Config = toml::from_str(
             r#"
@@ -30285,6 +30753,39 @@ zeroclaw-operators = "operator"
     }
 
     #[test]
+    async fn legacy_plugin_dirs_detects_data_destination_after_workspace_override() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_dirs(tmp.path());
+        let migrated = v2::workspace_toplevel_v3_path(&config.install_root_dir(), "plugins");
+        assert_eq!(migrated, config.install_root_dir().join("data/plugins"));
+        assert_ne!(migrated, config.data_dir.join("plugins"));
+        write_plugin(&migrated, "resumed");
+        config
+            .agents
+            .entry("default".into())
+            .or_default()
+            .workspace
+            .path = Some(tmp.path().join("custom-workspace"));
+        assert_ne!(
+            config.agent_workspace_dir("default").join("plugins"),
+            migrated
+        );
+
+        assert_eq!(legacy_plugin_dirs_with_entries(&config), vec![migrated]);
+    }
+
+    #[test]
+    async fn legacy_plugin_dirs_skips_resumed_destination_when_it_is_the_target() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_dirs(tmp.path());
+        let migrated = v2::workspace_toplevel_v3_path(&config.install_root_dir(), "plugins");
+        config.plugins.plugins_dir = migrated.to_string_lossy().into_owned();
+        write_plugin(&migrated, "current");
+
+        assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+    }
+
+    #[test]
     async fn legacy_plugin_dirs_empty_when_no_legacy_plugins() {
         let tmp = TempDir::new().unwrap();
         let config = config_with_dirs(tmp.path());
@@ -30305,6 +30806,78 @@ zeroclaw-operators = "operator"
 
         // The data-dir candidate now equals the target → not a "legacy" dir.
         assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+    }
+
+    #[test]
+    async fn legacy_plugin_dirs_excludes_historical_and_live_agent_workspaces() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_dirs(tmp.path());
+        let historical = config.agent_workspace_dir("default").join("plugins");
+        write_plugin(&historical, "historical");
+        config
+            .agents
+            .entry("default".into())
+            .or_default()
+            .workspace
+            .path = Some(tmp.path().join("custom-workspace"));
+        write_plugin(
+            &config.agent_workspace_dir("default").join("plugins"),
+            "live",
+        );
+        assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+    }
+
+    #[test]
+    async fn legacy_plugin_dirs_skips_canonical_target_and_duplicate_candidates() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_dirs(tmp.path());
+        let data = config.data_dir.join("plugins");
+        write_plugin(&data, "current");
+        config.plugins.plugins_dir = data
+            .join("..")
+            .join("plugins")
+            .to_string_lossy()
+            .into_owned();
+        assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+
+        config.plugins.plugins_dir = tmp.path().join("managed").to_string_lossy().into_owned();
+        config.data_dir = config.install_root_dir().join("workspace");
+        let legacy = config.data_dir.join("plugins");
+        write_plugin(&legacy, "legacy");
+        assert_eq!(legacy_plugin_dirs_with_entries(&config), vec![legacy]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn legacy_plugin_dirs_follows_supported_alias_candidates() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_dirs(tmp.path());
+        let outside = tmp.path().join("outside");
+        write_plugin(&outside, "unselected");
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let data_alias = config.data_dir.join("plugins");
+        symlink(&outside, &data_alias).unwrap();
+        let legacy = config.install_root_dir().join("workspace/plugins");
+        std::fs::create_dir_all(&legacy).unwrap();
+        symlink(outside.join("unselected"), legacy.join("linked-package")).unwrap();
+        assert_eq!(
+            legacy_plugin_dirs_with_entries(&config),
+            vec![data_alias.clone()]
+        );
+        // An ordinary package directory can still use a manifest alias under
+        // the existing runtime manifest-loading contract.
+        std::fs::create_dir_all(legacy.join("linked-manifest")).unwrap();
+        symlink(
+            outside.join("unselected/manifest.toml"),
+            legacy.join("linked-manifest/manifest.toml"),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_plugin_dirs_with_entries(&config),
+            vec![data_alias, legacy]
+        );
     }
 
     // ── Defaults ─────────────────────────────────────────────
@@ -33809,6 +34382,40 @@ runtime_profile = "fast"
 "#;
         let parsed = parse_test_config(raw);
         assert_eq!(parsed.effective_max_tool_iterations("default"), 25);
+    }
+
+    #[test]
+    async fn runtime_profile_single_tool_rounds_defaults_off_and_resolves_by_agent() {
+        let mut parsed = parse_test_config(
+            r#"
+[runtime_profiles.interactive]
+single_tool_rounds = true
+[runtime_profiles.batch]
+single_tool_rounds = false
+[runtime_profiles.unset]
+[agents.enabled]
+runtime_profile = "interactive"
+[agents.disabled]
+runtime_profile = "batch"
+[agents.unset]
+runtime_profile = "unset"
+[agents.missing]
+runtime_profile = "missing"
+"#,
+        );
+        assert_eq!(RuntimeProfileConfig::default().single_tool_rounds, None);
+        assert!(parsed.effective_single_tool_rounds("enabled"));
+        for alias in ["disabled", "unset", "missing", "unknown"] {
+            assert!(!parsed.effective_single_tool_rounds(alias));
+        }
+        parsed
+            .runtime_profiles
+            .get_mut("interactive")
+            .unwrap()
+            .single_tool_rounds = Some(false);
+        assert!(!parsed.effective_single_tool_rounds("enabled"));
+        let serialized = toml::to_string(&parsed.runtime_profiles["batch"]).unwrap();
+        assert!(serialized.contains("single_tool_rounds = false"));
     }
 
     #[test]
